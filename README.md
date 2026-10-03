@@ -13,9 +13,16 @@ Every binary gets an `hid_input` score + bucket (`strong`/`candidate`/`weak`/
 `none`) and a LOLDrivers cross-reference so that subset is scannable — see
 [Index](#index--driversindexjsonl) and [Query](#query--pipelinequery).
 
-**Collection only.** No signature verification, no fingerprint, no scope
-profiles, no analyze stage. If you need triage downstream, feed
-`pipeline_out/drivers/` into the parent `hid-driver-triage` repo.
+**Collection, then triage.** Collection stays indiscriminate — it stores every
+`.sys` it can pull. Two stages downstream turn that raw net into the target set:
+
+- [`pipeline.triage`](#triage--pipelinetriage) — a reproducible policy gate
+  (production-signed? x64? user-reachable device?) that prunes what can never
+  match and writes a lean [`reports/index.jsonl`](#lean-index--reportsindexjsonl).
+- [`pipeline.disasm`](#disassembly--pipelinedisasm) — an optional Ghidra-headless
+  stage that follows `DriverEntry` to decide, with code not strings, whether a
+  driver injects synthetic mouse movement (b) and exposes a user-openable symlink
+  right after `sc start` (c).
 
 ## Run
 
@@ -58,7 +65,16 @@ JSON object keyed by `sha256`:
   - **debug** — CodeView PDB path, GUID, age (original build identity)
   - **resources** — manifest/RCDATA presence, `version_info` (CompanyName,
     OriginalFilename, FileVersion, …)
-  - **signature** — embedded Authenticode presence + certificate common names
+  - **signature** — embedded Authenticode presence, the **signer leaf** cert
+    (`signer_cn`, `issuer_cn`, code-signing EKU) and a `cert_class` verdict
+    (`production` / `test` / `private` / `unsigned`) — the signer is separated
+    from the CA and timestamp chain, so a test cert timestamped by a commercial
+    TSA is no longer mistaken for a production one (see `pipeline/sigcheck.py`)
+  - **kmdf** — `is_kmdf` (binds `wdfldr.sys`); KMDF routes device/symlink
+    creation through the WDF function table, invisible to import-based heuristics
+  - **device** — user-mode surface read statically: `framework` (wdm/kmdf/both),
+    `declares_symlink`, the `\DosDevices\`/`\??\` `symlink_paths`, and any
+    embedded `sddl` + whether it `sddl_grants_user` (a non-admin can open it)
   - **overlay** — appended data (offset, size, entropy)
   - **strings** — deduped ASCII/UTF-16 + `interesting_strings`
     (device paths, registry, GUIDs, URLs, other `.sys`)
@@ -184,6 +200,10 @@ Filters combine with **AND**; a repeated flag **OR**s its own values.
 | `--capability {input_injection,phys_mem,msr_control_reg,port_io,process_access,mem_copy,device_io,any}` | capability bucket present |
 | `--hid-bucket {strong,candidate,weak,none}`, `--min-hid-score N`, `--creates-user-device` | HID-injection signal |
 | `--signed` / `--unsigned` | embedded Authenticode |
+| `--prod-cert`, `--cert-class {production,test,private,unsigned}` | signer cert verdict |
+| `--kmdf` | KMDF driver (binds `wdfldr`) |
+| `--declares-symlink`, `--user-open` | user-reachable device surface / SDDL grants a non-admin |
+| `--injects`, `--symlink-reachable` | disasm verdicts: mouse injection / symlink reachable from `DriverEntry` |
 | `--loldrivers` | known in the vendored LOLDrivers snapshot |
 | `--wx`, `--driver`, `--overlay` | W^X section / looks-like-driver / appended overlay |
 | `--min-entropy H` / `--max-entropy H` | file entropy |
@@ -196,6 +216,79 @@ like `sha,arch,sig,hid,lol,caps,name` or any dotted path such as
 string dump, omitted by default), `--count`, `--stats`, `--show SHA` (sha256
 prefix). Sort with `--sort FIELD [--desc]` (default: strongest `hid_input` first)
 and cap with `--limit N`.
+
+## Triage — `pipeline.triage`
+
+The policy gate the collector never had. It folds the index, applies composable
+**gates**, and reports — or, with `--apply`, prunes — the drivers that fail.
+Default is a dry run. It also writes the lean [`reports/index.jsonl`](#lean-index--reportsindexjsonl).
+
+```bash
+docker compose run --rm triage                      # dry run, 'loadable' preset
+docker compose run --rm triage --target             # the net's (a)+(c) goal
+python -m pipeline.triage --require prod-cert --apply   # delete the rest + index lines
+```
+
+| Gate | Passes when |
+|------|-------------|
+| `signed` | embedded Authenticode present |
+| `prod-cert` | signature `cert_class` is `production` (not test/private/unsigned) |
+| `x64` | PE arch is x64 (loads on a 64-bit Windows kernel) |
+| `driver` | looks like a kernel driver (native subsystem / ntoskrnl import) |
+| `device` | declares a user-reachable device + symlink surface |
+| `user-open` | an embedded SDDL grants a non-admin principal |
+| `hid` | `hid_input` bucket is strong or candidate |
+| `not-lol` / `lol` | absent from / present in the vendored LOLDrivers set |
+
+Presets: `--loadable` (`signed,prod-cert,x64`) is the "stop wasting space"
+baseline; `--target` (`+driver,device`) is the project's stated goal. `--apply`
+deletes each failing `<sha>.sys`, drops its index lines, and writes a
+`triage_removed_<ts>.txt` manifest first.
+
+## Disassembly — `pipeline.disasm`
+
+Byte-parsing only shows *adjacency*. Proving (b) a driver drives the mouse class
+service callback, and (c) its symlink is created from `DriverEntry` (not behind
+PnP/hardware) and is user-openable, needs following code. This optional stage
+drives Ghidra's `analyzeHeadless` + `ghidra_scripts/DriverTriage.py` over the
+triage-selected subset (so it runs on hundreds, not thousands):
+
+```bash
+docker compose build --build-arg WITH_GHIDRA=1 disasm
+docker compose run --rm disasm --limit 50           # or: --sha 40061b30
+```
+
+For each driver it resolves the KMDF WDF function-table calls, decompiles
+`DriverEntry` and its callees, finds the symlink-referencing function and its
+callers, and writes per-driver artifacts under `reports/<sha256>/`:
+
+```
+reports/<sha256>/
+  <driver_name>.sys                    # the binary, named for the driver
+  <driver_name>-driver-entry.c         # pseudo-C of DriverEntry
+  disassembly.txt                      # verdicts + evidence + full pseudo-C
+```
+
+It also appends a compact `kind:"disasm"` line to the store index (so
+`query --injects` / `--symlink-reachable` work) and refreshes the lean index.
+Static reachability is strong evidence, not proof — final (c) confirmation is a
+dynamic load in an isolated VM. The WDF index→name map in `DriverTriage.py` is
+version-sensitive; unknown indices are reported with their raw number.
+
+## Lean index — `reports/index.jsonl`
+
+`drivers/index.jsonl` is the complete, append-only store record — big, because
+each line carries the raw string dump and full import map needed to *compute* the
+signals. `reports/index.jsonl` is the consumer view: one short line per driver
+(~1.7% the size), only the triage-relevant fields and the disasm verdicts,
+best-candidate first, each pointing at its `reports/<sha256>/` folder. Written by
+`pipeline.triage` (the passing set) and refreshed by `pipeline.disasm`.
+
+```json
+{"sha256":"…","name":"ETD.sys","arch":"x64","signer":"ELAN MICROELECTRONICS CORPORATION",
+ "cert_class":"production","kmdf":true,"framework":"kmdf","declares_symlink":true,
+ "symlink_paths":["\\DosDevices\\ETD"],"sddl_grants_user":true,"hid":"candidate:7","report":"…"}
+```
 
 ## Tuning
 
@@ -227,9 +320,13 @@ Category IDs on the aggregator:
 
 ## What's inside the image
 
-Python 3.13-slim + `p7zip-full` + `curl`. The Python code uses stdlib only;
-no `pefile`, `pyyaml`, `cryptography`, or anything else from the parent repo.
-Image is ~130 MB.
+Python 3.13-slim + `p7zip-full` + `curl` + `osslsigncode` (authoritative
+signature verification when present). The Python code uses stdlib only — no
+`pefile`, `pyyaml`, `cryptography`, or anything else from the parent repo; the PE
+parser, the PKCS#7/ASN.1 signer walk (`sigcheck.py`) and the index are all
+hand-rolled. Base image is ~130 MB. Two optional build args add weight only when
+used: `WITH_PLAYWRIGHT=1` (Chromium, for the deep catalog crawl) and
+`WITH_GHIDRA=1` (JDK + Ghidra, for `pipeline.disasm`).
 
 ## Safety model
 

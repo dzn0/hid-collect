@@ -68,6 +68,34 @@ def signtool() -> Path | None:
     return _resolve("PDT_SIGNTOOL", "signtool.exe", LEGACY_SIGNTOOL)
 
 
+def ghidra_headless() -> Path | None:
+    """Locate Ghidra's ``analyzeHeadless`` launcher, or None if not installed.
+
+    Order: ``PDT_GHIDRA_HEADLESS`` (full path to the script), then
+    ``PDT_GHIDRA_HOME``/support/analyzeHeadless[.bat], then ``vendor/tools``,
+    then PATH. The disasm stage is optional, so callers must handle None.
+    """
+    env = os.environ.get("PDT_GHIDRA_HEADLESS")
+    if env and Path(env).exists():
+        return Path(env)
+    home = os.environ.get("PDT_GHIDRA_HOME")
+    names = ("analyzeHeadless", "analyzeHeadless.bat")
+    if home:
+        for name in names:
+            cand = Path(home) / "support" / name
+            if cand.exists():
+                return cand
+    for name in names:
+        cand = VENDOR_TOOLS / name
+        if cand.exists():
+            return cand
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
 def output_root() -> Path:
     env = os.environ.get("PDT_OUTPUT_DIR")
     root = Path(env) if env else REPO_ROOT / "pipeline_out"
@@ -83,5 +111,17 @@ def drivers_dir() -> Path:
 
 def collectors_dir() -> Path:
     d = output_root() / "collectors"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def reports_dir() -> Path:
+    """Human-readable per-driver disasm output: ``<repo>/reports/<sha256>/``.
+
+    Distinct from the machine store under ``pipeline_out/`` — overridable with
+    ``PDT_REPORTS_DIR``.
+    """
+    env = os.environ.get("PDT_REPORTS_DIR")
+    d = Path(env) if env else REPO_ROOT / "reports"
     d.mkdir(parents=True, exist_ok=True)
     return d

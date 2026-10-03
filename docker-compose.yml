@@ -70,6 +70,32 @@ services:
       PDT_MSC_BROWSER_WORKERS: "3"
     command: ["pipeline.collect", "msupdate-catalog"]
 
+  # Policy gate over the collected corpus. Dry run by default — prints what the
+  # gates would drop (test-signed, non-x64, no device surface, …). Add --apply
+  # to actually prune the store + index. See pipeline/triage.py for gates.
+  #   docker compose run --rm triage                      # dry run, 'loadable'
+  #   docker compose run --rm triage --target             # the net's (a)+(c) goal
+  #   docker compose run --rm triage --require prod-cert --apply
+  triage:
+    <<: *hc-common
+    command: ["pipeline.triage"]
+
+  # Disassembly stage: Ghidra headless follows DriverEntry to decide mouse
+  # injection (b) and user-reachable symlink (c). Heavy — needs the Ghidra image:
+  #   docker compose build --build-arg WITH_GHIDRA=1 disasm
+  #   docker compose run --rm disasm --limit 50
+  # Runs only over triage 'target' candidates by default, appending kind:disasm
+  # lines that fold onto the analysis records.
+  disasm:
+    <<: *hc-common
+    tty: true
+    image: hid-collect:ghidra
+    build:
+      context: .
+      args:
+        WITH_GHIDRA: "1"
+    command: ["pipeline.disasm"]
+
   tight:
     <<: *hc-common
     tty: true

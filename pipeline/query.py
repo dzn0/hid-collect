@@ -108,6 +108,14 @@ _RESOLVERS: dict[str, Callable[[dict], Any]] = {
     "entropy": lambda r: r.get("entropy") or 0.0,
     "sig": lambda r: "Y" if _signed(r) else "-",
     "signed": _signed,
+    "cert": lambda r: _dig(r, "pe.signature.cert_class") or "-",
+    "signer": lambda r: _dig(r, "pe.signature.signer_cn") or "-",
+    "kmdf": lambda r: "Y" if _dig(r, "pe.kmdf.is_kmdf") else "-",
+    "fw": lambda r: _dig(r, "device.framework") or "-",
+    "symlink": lambda r: "Y" if _dig(r, "device.declares_symlink") else "-",
+    "useropen": lambda r: "Y" if _dig(r, "device.sddl_grants_user") else "-",
+    "inject": lambda r: "Y" if _dig(r, "disasm.mouse_injection.verdict") else "-",
+    "reach": lambda r: "Y" if _dig(r, "disasm.symlink_user_reachable") else "-",
     "hid": lambda r: f"{_dig(r, 'hid_input.bucket') or 'none'}:{_dig(r, 'hid_input.score') or 0}",
     "hid_bucket": lambda r: _dig(r, "hid_input.bucket") or "none",
     "hid_score": lambda r: _dig(r, "hid_input.score") or 0,
@@ -178,6 +186,21 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
         preds.append(_signed)
     if a.unsigned:
         preds.append(lambda r: not _signed(r))
+    if a.cert_class:
+        want = set(a.cert_class)
+        preds.append(lambda r: (_dig(r, "pe.signature.cert_class") or "unknown") in want)
+    if a.prod_cert:
+        preds.append(lambda r: _dig(r, "pe.signature.cert_class") == "production")
+    if a.kmdf:
+        preds.append(lambda r: bool(_dig(r, "pe.kmdf.is_kmdf")))
+    if a.declares_symlink:
+        preds.append(lambda r: bool(_dig(r, "device.declares_symlink")))
+    if a.user_open:
+        preds.append(lambda r: bool(_dig(r, "device.sddl_grants_user")))
+    if a.injects:
+        preds.append(lambda r: bool(_dig(r, "disasm.mouse_injection.verdict")))
+    if a.symlink_reachable:
+        preds.append(lambda r: bool(_dig(r, "disasm.symlink_user_reachable")))
     if a.loldrivers:
         preds.append(lambda r: bool(_dig(r, "loldrivers.known")))
     if a.wx:
@@ -435,6 +458,20 @@ def main(argv: list[str] | None = None) -> int:
                    help="hid_input.creates_user_device is true")
     f.add_argument("--signed", action="store_true", help="has embedded Authenticode")
     f.add_argument("--unsigned", action="store_true", help="no embedded Authenticode")
+    f.add_argument("--cert-class", action="append", dest="cert_class", metavar="CLASS",
+                   help="signature cert_class in {production,test,private,unsigned,unknown} "
+                        "(repeatable)")
+    f.add_argument("--prod-cert", action="store_true", dest="prod_cert",
+                   help="signed with a production certificate")
+    f.add_argument("--kmdf", action="store_true", help="KMDF driver (binds wdfldr)")
+    f.add_argument("--declares-symlink", action="store_true", dest="declares_symlink",
+                   help="declares a user-reachable device+symlink surface")
+    f.add_argument("--user-open", action="store_true", dest="user_open",
+                   help="an embedded SDDL grants a non-admin principal")
+    f.add_argument("--injects", action="store_true",
+                   help="disasm verdict: drives the mouse class service callback")
+    f.add_argument("--symlink-reachable", action="store_true", dest="symlink_reachable",
+                   help="disasm verdict: symlink created from DriverEntry and user-openable")
     f.add_argument("--loldrivers", action="store_true", help="known in the LOLDrivers snapshot")
     f.add_argument("--wx", action="store_true", help="has a writable+executable section")
     f.add_argument("--driver", action="store_true", help="PE looks like a kernel driver")

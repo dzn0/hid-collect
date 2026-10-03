@@ -1,0 +1,201 @@
+"""Drive `analyzeHeadless` over selected drivers and fold the verdicts back in.
+
+    python -m pipeline.disasm                 # disasm every `target`-gate candidate
+    python -m pipeline.disasm --gate target   # (default) the triage preset to select
+    python -m pipeline.disasm --sha 40061b30   # one driver by sha256 prefix
+    python -m pipeline.disasm --limit 50       # cap this run
+    python -m pipeline.disasm --rebuild        # re-run even if a disasm line exists
+
+Each run appends one ``{"sha256", "kind": "disasm", ...}`` line per driver to
+``drivers/index.jsonl``; `fold_index` merges it onto the analysis line, so the
+query layer sees the new verdicts (`mouse_injection`, `symlink_user_reachable`)
+alongside the static fields. Already-analysed drivers are skipped unless
+``--rebuild``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from .. import config
+from .. import index as _index
+from .. import triage
+from ..collectors import _common as C
+
+_SCRIPT_DIR = Path(__file__).resolve().parent / "ghidra_scripts"
+_SCRIPT = "DriverTriage.py"
+_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _name_base(rec: dict, sha: str) -> str:
+    """Human driver name for the report files, from the index record."""
+    vi = (((rec.get("pe") or {}).get("resources") or {}).get("version_info") or {})
+    cand = (rec.get("original_name") or vi.get("OriginalFilename")
+            or vi.get("InternalName") or "")
+    cand = cand.strip()
+    if cand.lower().endswith(".sys"):
+        cand = cand[:-4]
+    cand = _SAFE.sub("_", cand).strip("_")
+    return cand or f"driver_{sha[:12]}"
+
+
+def analyze_driver(sys_path: Path, ghidra: Path, *, report_dir: Path | None = None,
+                   name_base: str = "driver", timeout: int = 600) -> dict:
+    """Run Ghidra headless on one .sys and return the DriverTriage findings dict.
+
+    Creates a throwaway project per binary (keeps runs independent and lets the
+    caller parallelise later), points the post-script at a temp JSON file, and
+    parses it back. When ``report_dir`` is given the post-script also writes the
+    human artifacts (disassembly.txt, <name_base>-driver-entry.c) there. On any
+    failure returns ``{"ok": False, "error": ...}`` — disassembly must never sink
+    the pipeline.
+    """
+    sha = sys_path.stem
+    with tempfile.TemporaryDirectory(prefix="ghidra_") as tmp:
+        tmpd = Path(tmp)
+        out_json = tmpd / "triage.json"
+        cmd = [
+            str(ghidra), str(tmpd), f"proj_{sha[:12]}",
+            "-import", str(sys_path),
+            "-scriptPath", str(_SCRIPT_DIR),
+            "-postScript", _SCRIPT, str(out_json),
+            str(report_dir or ""), name_base,
+            "-analysisTimeoutPerFile", str(max(30, timeout - 30)),
+            "-deleteProject",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "ghidra timeout"}
+        except OSError as e:
+            return {"ok": False, "error": f"ghidra spawn failed: {e}"}
+        if out_json.exists():
+            try:
+                return json.loads(out_json.read_text(encoding="utf-8", errors="replace"))
+            except ValueError as e:
+                return {"ok": False, "error": f"bad post-script json: {e}",
+                        "stderr": proc.stderr[-400:]}
+        return {"ok": False, "error": "no post-script output",
+                "stderr": (proc.stderr or proc.stdout)[-400:]}
+
+
+def _done_shas(drivers_dir: Path) -> set[str]:
+    path = drivers_dir / "index.jsonl"
+    done: set[str] = set()
+    if not path.exists():
+        return done
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("kind") == "disasm" and r.get("sha256"):
+            done.add(r["sha256"])
+    return done
+
+
+def _select(records: dict[str, dict], gate: str, sha_prefix: str | None) -> list[str]:
+    if sha_prefix:
+        return [s for s in records if s.startswith(sha_prefix.lower())]
+    gates = triage.PRESETS.get(gate, [gate])
+    passing, _ = triage.evaluate(
+        {s: r for s, r in records.items() if triage._pe(r)}, gates)
+    return passing
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="pipeline.disasm",
+        description="Ghidra headless verdicts (mouse injection / symlink reachability).")
+    ap.add_argument("--gate", default="target",
+                    help="triage preset or single gate selecting candidates "
+                         f"(default: target; presets: {','.join(triage.PRESETS)})")
+    ap.add_argument("--sha", help="disasm only drivers whose sha256 starts with this")
+    ap.add_argument("--limit", type=int, default=0, help="cap drivers this run (0 = all)")
+    ap.add_argument("--timeout", type=int, default=600, help="per-driver seconds (default 600)")
+    ap.add_argument("--rebuild", action="store_true", help="re-run even if a disasm line exists")
+    args = ap.parse_args(argv)
+
+    ghidra = config.ghidra_headless()
+    if ghidra is None:
+        print("ghidra analyzeHeadless not found. Set PDT_GHIDRA_HOME (or "
+              "PDT_GHIDRA_HEADLESS), drop it under vendor/tools/, or build the "
+              "image with --build-arg WITH_GHIDRA=1.", file=sys.stderr)
+        return 2
+
+    drivers_dir = config.drivers_dir()
+    reports_root = config.reports_dir()
+    records = _index.fold_index(drivers_dir)
+    candidates = _select(records, args.gate, args.sha)
+    done = set() if args.rebuild else _done_shas(drivers_dir)
+    todo = [s for s in candidates if s not in done]
+    if args.limit > 0:
+        todo = todo[:args.limit]
+
+    print(f"ghidra: {ghidra}")
+    print(f"reports: {reports_root}")
+    print(f"candidates ({args.sha or args.gate}): {len(candidates)}  "
+          f"already done: {len(candidates) - len(todo) if not args.limit else '-'}  "
+          f"to run: {len(todo)}")
+
+    ran = ok = inj = reach = 0
+    for sha in todo:
+        sys_path = drivers_dir / f"{sha}.sys"
+        if not sys_path.exists():
+            continue
+        rec = records.get(sha, {})
+        name_base = _name_base(rec, sha)
+        report_dir = reports_root / sha
+        report_dir.mkdir(parents=True, exist_ok=True)
+        # drop the binary next to its report, named for the driver
+        try:
+            shutil.copy2(sys_path, report_dir / f"{name_base}.sys")
+        except OSError:
+            pass
+
+        t0 = time.monotonic()
+        findings = analyze_driver(sys_path, ghidra, report_dir=report_dir,
+                                  name_base=name_base, timeout=args.timeout)
+        ran += 1
+        # keep a compact verdict in the index so query --injects/--symlink-reachable work
+        verdict = {k: findings.get(k) for k in
+                   ("ok", "driver_entry", "mouse_injection", "symlink",
+                    "symlink_user_reachable", "wdf_calls", "error")}
+        C.append_index(drivers_dir, {"sha256": sha, "kind": "disasm", "disasm": verdict})
+        if findings.get("ok"):
+            ok += 1
+            if (findings.get("mouse_injection") or {}).get("verdict"):
+                inj += 1
+            if findings.get("symlink_user_reachable"):
+                reach += 1
+        status = "ok" if findings.get("ok") else findings.get("error", "fail")
+        print(f"  [{ran}/{len(todo)}] {sha[:16]} -> {report_dir.name} "
+              f"{time.monotonic()-t0:5.1f}s  {status}", file=sys.stderr)
+
+    print(f"done: ran {ran}, parsed {ok}, mouse-injection {inj}, "
+          f"symlink-user-reachable {reach}")
+
+    # refresh the lean reports index so the new disasm verdicts show up in it
+    refreshed = _index.fold_index(drivers_dir)
+    sel = _select(refreshed, args.gate, args.sha) if not args.sha else list(refreshed)
+    n = triage.write_reports_index(
+        {s: r for s, r in refreshed.items() if triage._pe(r)},
+        [s for s in sel if triage._pe(refreshed.get(s, {}))],
+        reports_root / "index.jsonl")
+    print(f"per-driver reports under {reports_root}/<sha256>/")
+    print(f"lean index: {reports_root / 'index.jsonl'}  ({n} line(s))")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

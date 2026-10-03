@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 from . import config
+from . import sigcheck
 from .collectors import _common as C
 
 _REFS = Path(__file__).resolve().parent / "refs"
@@ -111,6 +112,21 @@ _HID_CLASS_GUIDS = {
     "4d1e55b2-f16f-11cf-88cb-001111000030": "GUID_DEVINTERFACE_HID",
     "745a17a0-74d3-11d0-b6fe-00a0c90f57da": "HIDClass",
 }
+
+# KMDF drivers route every framework call (WdfDeviceCreate,
+# WdfControlDeviceInitAllocate, WdfDeviceCreateSymbolicLink, …) through the WDF
+# function-table dispatch, so those never show up as imports — the only static
+# tell of KMDF is the bind import to wdfldr.sys. A device/symlink heuristic that
+# keys on IoCreateDevice is therefore blind to ~3/4 of a HID corpus.
+_KMDF_IMPORT_TELLS = {"wdfversionbind", "wdfversionbindclass", "wdfversionunbind"}
+
+# SDDL: the security descriptor passed to IoCreateDeviceSecure /
+# WdfDeviceInitAssignSDDLString is frequently a literal string in the image.
+# It is the clearest static signal for "can a user-mode process open this?".
+_SDDL_RE = re.compile(r"D:(?:P|AR|AI)*\((?:A|D);[^\s\"']{2,200}")
+# ACE principals that grant access to an ordinary (non-admin) user:
+# WD Everyone, AU Authenticated Users, IU Interactive Users, BU Built-in Users.
+_SDDL_WORLD = re.compile(r";;;(WD|AU|IU|BU)\)")
 
 _ASCII_PAT = rb"[\x20-\x7e]{%d,}"
 _UTF16_PAT = rb"(?:[\x20-\x7e]\x00){%d,}"
@@ -440,10 +456,16 @@ class PE:
     def signature(self) -> dict:
         off, size = self.dir(4)  # NOTE: security dir offset is a FILE offset
         if not size or off + size > len(self.data):
-            return {"embedded": False}
+            return {"embedded": False, "cert_class": "unsigned"}
         blob = self.data[off:off + size]
         cert = blob[8:] if len(blob) > 8 else b""  # skip WIN_CERTIFICATE header
-        return {"embedded": True, "size": size, "cert_common_names": _cert_cns(cert)}
+        out = {"embedded": True, "size": size}
+        try:
+            out.update(sigcheck.classify(cert))     # signer leaf + cert_class
+        except Exception:
+            out["cert_common_names"] = _cert_cns(cert)  # crude fallback
+            out["cert_class"] = "unknown"
+        return out
 
 
 # ------------------------------------------------------- version-info parser
@@ -572,6 +594,61 @@ def hid_input_signals(imports_flat: set[str], all_strs_low: list[str],
             "creates_user_device": bool(creates_device)}
 
 
+# --------------------------------------------------------- device / symlink surface
+
+
+def device_surface(imports_flat: set[str], is_kmdf: bool,
+                   device_paths: list[str], all_strs: list[str]) -> dict:
+    """Static read of how (and whether) the driver exposes a user-mode surface.
+
+    This is a *declaration* signal, not proof of reachability — it says the bytes
+    contain the ingredients of a user-openable device + symlink. Proving the
+    symlink is actually created from ``DriverEntry`` (not behind PnP/AddDevice)
+    and that the security descriptor lets a user open it needs the disassembly
+    stage (`pipeline.disasm`); this gives the cheap pre-filter that keeps that
+    stage pointed at the ~hundreds of plausible drivers instead of thousands.
+
+    Covers both frameworks: WDM (IoCreateDevice[Secure] + IoCreateSymbolicLink,
+    visible as imports) and KMDF (WdfDeviceCreateSymbolicLink goes through the
+    WDF table and is invisible as an import, so a user-mode symlink path string
+    plus the KMDF bind is the tell).
+    """
+    wdm_create = bool({"iocreatedevice", "iocreatedevicesecure",
+                       "wdmlibiocreatedevicesecure"} & imports_flat)
+    wdm_symlink = "iocreatesymboliclink" in imports_flat
+    # user-mode-reachable symlink path forms: \DosDevices\X or \??\X (NOT \Device\)
+    sym_paths = sorted({p for p in device_paths
+                        if "\\dosdevices\\" in p.lower() or "\\??\\" in p.lower()})
+    # SDDL descriptors embedded in the image + whether any grants non-admin open
+    sddl = sorted({m.group(0) for s in all_strs for m in [_SDDL_RE.search(s)] if m})
+    world_open = any(_SDDL_WORLD.search(s) for s in sddl)
+
+    if wdm_create and is_kmdf:
+        framework = "both"
+    elif is_kmdf:
+        framework = "kmdf"
+    elif wdm_create or wdm_symlink:
+        framework = "wdm"
+    else:
+        framework = "none"
+
+    # declares a user-reachable symlink if: WDM create+symlink imports, OR a
+    # \DosDevices\\??\ path string alongside a device-creating framework.
+    declares_symlink = bool(
+        (wdm_create and wdm_symlink)
+        or (sym_paths and (wdm_create or is_kmdf))
+    )
+    return {
+        "framework": framework,
+        "wdm_create": wdm_create,
+        "wdm_symlink": wdm_symlink,
+        "declares_symlink": declares_symlink,
+        "symlink_paths": sym_paths[:20],
+        "sddl": sddl[:10],
+        "sddl_grants_user": world_open,
+    }
+
+
 # ------------------------------------------------------------------ loldrivers
 
 
@@ -618,6 +695,7 @@ def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict
     pe = PE(data)
     imphash = None
     imports_flat: set[str] = set()
+    is_kmdf = False
     if pe.ok:
         try:
             imports = pe.imports()
@@ -628,8 +706,14 @@ def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict
                     for cat, names in _CAPABILITIES.items()
                     if imports_flat & names}
             overlay = _overlay(pe, data)
+            dlls_low = {d.lower() for d in imports}
+            is_kmdf = ("wdfldr.sys" in dlls_low
+                       or any("wdfldr" in d for d in dlls_low)
+                       or bool(imports_flat & _KMDF_IMPORT_TELLS))
             entry["pe"] = {
                 **pe.header(),
+                "kmdf": {"is_kmdf": is_kmdf,
+                         "framework": "kmdf" if is_kmdf else "wdm"},
                 "sections": pe.sections_info(),
                 "imports": imports,
                 "import_dll_count": len(imports),
@@ -655,6 +739,8 @@ def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict
     entry["interesting_strings"] = inter
     entry["hid_input"] = hid_input_signals(
         imports_flat, [s.lower() for s in all_strs], set(inter["guids"]))
+    entry["device"] = device_surface(
+        imports_flat, is_kmdf, inter["device_paths"], all_strs)
     entry["loldrivers"] = loldrivers_match(path.stem, imphash)
     return entry
 
