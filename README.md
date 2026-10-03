@@ -109,10 +109,13 @@ Mad Catz, Saitek, Cooler Master, Wooting, CHERRY, Ducky, Pulsar, Mountain,
 Mionix, Fnatic, Kensington, Endgame Gear, ZOWIE, Dygma, MonsGeek, Akko, …).
 A tight mouse+keyboard-only run drops gamepad category too:
 
+The same filter preset is baked into the `tight` compose service — same volume
+as `run`, so discovery cache and `processed.jsonl` are shared and switching
+between the two does not re-walk the site or re-download:
+
 ```bash
-PDT_HID_CATEGORIES=10,11 \
-PDT_HID_BRAND_ALLOW="razer,logitech,corsair,steelseries,hyperx,roccat,wooting,glorious,cherry,ducky,pulsar,mountain,akko,mionix,fnatic,endgame,zowie,kensington,dygma,monsgeek,obins,melgeek,kemove,klim,drevo,tesoro,viper,havit,alienware,g.skill,msi,asus,aorus,evga,cougar,mad catz,bloody" \
-docker compose run --rm run
+docker compose run --rm tight     # cats 10,11 + 81-brand mouse/kbd allowlist
+                                   # (~5100 pkgs vs run's ~5200)
 ```
 
 ## Query — `pipeline.query`

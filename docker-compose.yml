@@ -33,3 +33,29 @@ services:
     <<: *hc-common
     tty: true
     command: ["pipeline.collect", "touslesdrivers-input"]
+
+  # Tight scope: only brands whose products are mouse/keyboard peripherals
+  # (plus the motherboard-gaming vendors that ship bundled HID stacks). Drops
+  # tablet/gamepad site categories entirely, then an explicit ALLOW keeps 81
+  # brands / ~5100 pkgs out of the 7796-URL universe — the slice where strings
+  # like MouseClassServiceCallback actually ship.
+  #
+  # Discovery cache and processed.jsonl are shared with `run` (same volume),
+  # so switching between the two does not re-walk the site or re-download.
+  tight:
+    <<: *hc-common
+    tty: true
+    environment:
+      PDT_HID_CATEGORIES: "10,11"
+      PDT_HID_BRAND_ALLOW: >-
+        microsoft,logitech,razer,steelseries,corsair,hyperx,roccat,cherry,
+        wooting,obins,mountain,akko,ducky,pulsar,mionix,endgame gear,zowie,
+        kensington,dygma,monsgeek,melgeek,kemove,klim,drevo,tesoro,viper,
+        havit,glorious,bloody,cougar,saitek,mad catz,gamdias,redragon,
+        redthunder,lexip,lamzu,alienware,aorus,asus,cooler master,evga,
+        g.skill,gigabyte,msi,nzxt,lian li,fnatic,durgod,qpad,ozone,hkg,
+        coolkiller,yunzii,dareu,zelotes,a4tech,elecom,aula,endorfy,xanova,
+        xtrfy,fox spirit,g4m3r,mojo,matrix,protoarc,rantopad,tmkb,perixx,
+        fl.esports,sog,jelly comb,easars,empire gaming,art. lebedev,hyte,
+        kfa2,be quiet!,adata,mushkin
+    command: ["pipeline.collect", "touslesdrivers-input"]
