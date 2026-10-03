@@ -40,12 +40,17 @@ MONITOR = ConsoleTaskMonitor()
 MAX_DEPTH = 6          # callee depth from DriverEntry to decompile
 MAX_FUNCS = 160        # cap decompiled functions (headless time budget)
 
-# --- the real (b) signal: how a driver injects mouse movement ----------------
-# Symbol/string tells a driver that hooks the mouse class service callback
-# leaves behind, resolved from the class driver object at runtime.
+# --- (b) signals: two mechanisms for injecting synthetic HID input -----------
+# (1) hooking the mouse/keyboard class service callback (resolved from the class
+#     driver object at runtime), and
+# (2) a virtual-HID device fed synthetic reports from user mode over IOCTL
+#     (vhidmini/VHF-style) - no class-callback hook, but the same end: input
+#     that did not come from real hardware.
 _MOUSE_STRINGS = [
-    "\\driver\\mouclass", "\\device\\pointerclass", "mouclass",
-    "mouseclassservicecallback", "mouclassservicecallback",
+    "\\driver\\mouclass", "\\device\\pointerclass", "\\driver\\kbdclass",
+    "mouclass", "kbdclass", "mouseclassservicecallback",
+    "mouclassservicecallback", "keyboardclassservicecallback",
+    "mouse_input_data", "keyboard_input_data",
 ]
 _CONNECT_APIS = [
     "ObReferenceObjectByName", "IoGetDeviceObjectPointer",
@@ -53,6 +58,13 @@ _CONNECT_APIS = [
 ]
 # IOCTL_INTERNAL_MOUSE_CONNECT (0x0f0023) / KEYBOARD_CONNECT (0x0b0203)
 _CONNECT_IOCTLS = [0x0f0023, 0x0b0203]
+# virtual-HID injection tells: strings a driver that takes input reports from
+# user mode and replays them as HID input tends to carry.
+_VHID_STRINGS = [
+    "notify_inputdata", "notify_keystate", "inject", "reportdescriptor",
+    "myreportdescriptor", "vhf", "virtualhid", "vhidmini", "intercept_key",
+    "hidinject", "input_data", "set_table",
+]
 
 # --- the real (c) signal: symbolic link + control device --------------------
 _SYMLINK_APIS_WDM = ["IoCreateSymbolicLink", "IoCreateDevice",
@@ -115,6 +127,34 @@ def _reachable(start, max_depth, max_funcs):
         for callee in fn.getCalledFunctions(MONITOR):
             frontier.append((callee, d + 1))
     return list(seen.values())
+
+
+def _registered_callbacks(program, roots, max_funcs=64):
+    """Functions whose address is *taken* inside `roots` (callback registration).
+
+    KMDF stores EvtIoDeviceControl / EvtDriverDeviceAdd / EvtDeviceFileCreate as
+    function pointers in config structs; they are never `call`ed from DriverEntry,
+    so a callee walk misses them and the real injection/IOCTL logic goes
+    unanalysed. A code reference to a function's entry that is NOT a call is an
+    address-taken pointer - almost always a callback being registered.
+    """
+    fm = program.getFunctionManager()
+    refmgr = program.getReferenceManager()
+    root_addrs = set(r.getEntryPoint() for r in roots)
+    out = {}
+    for r in roots:
+        body = r.getBody()
+        ait = body.getAddresses(True)
+        while ait.hasNext() and len(out) < max_funcs:
+            a = ait.next()
+            for ref in refmgr.getReferencesFrom(a):
+                if ref.getReferenceType().isCall():
+                    continue
+                tgt = ref.getToAddress()
+                f = fm.getFunctionAt(tgt)
+                if f is not None and f.getEntryPoint() not in root_addrs:
+                    out[f.getEntryPoint()] = f
+    return list(out.values())
 
 
 def _decompile(dec, fn):
@@ -214,11 +254,29 @@ def _contains_any(text, needles):
     return [n for n in needles if n.lower() in low]
 
 
+def _load_static(path):
+    """Load the static `device` dict (from index.py) used as a fallback.
+
+    The byte-level analyzer catches evidence Ghidra's auto-analysis can miss on
+    CFG-guarded KMDF - notably the SDDL descriptor and the declared symlink
+    paths, which are raw .rdata constants Ghidra never types as strings.
+    """
+    try:
+        f = open(path)
+        try:
+            return json.load(f) or {}
+        finally:
+            f.close()
+    except Exception:
+        return {}
+
+
 def main():
     args = getScriptArgs()
     out_path = args[0] if args else "driver_triage.json"
     report_dir = args[1] if len(args) > 1 else None
     name_base = args[2] if len(args) > 2 else "driver"
+    static = _load_static(args[3]) if len(args) > 3 else {}
     program = getCurrentProgram()
     result = {
         "program": program.getName(),
@@ -231,11 +289,19 @@ def main():
         entry = _entry_function(program)
         if entry is None:
             result["error"] = "no DriverEntry / entry function found"
-            _write(out_path, result)
+            _write_json(out_path, result)
             return
         result["driver_entry"] = str(entry.getEntryPoint())
 
         reach = _reachable(entry, MAX_DEPTH, MAX_FUNCS)
+        # Seed in the WDF-registered callbacks (EvtIoDeviceControl, EvtDeviceAdd,
+        # EvtDeviceFileCreate...). They are stored as pointers, never called from
+        # DriverEntry, so the callee walk misses them - and that is exactly where
+        # the IOCTL / injection logic lives.
+        callbacks = _registered_callbacks(program, reach)
+        for fn in callbacks:
+            if fn not in reach:
+                reach.append(fn)
         for fn in reach:
             decomp[fn.getName()] = _decompile(dec, fn)
         entry_c = decomp.get(entry.getName(), _decompile(dec, entry))
@@ -244,6 +310,8 @@ def main():
         strings = _defined_strings(program)
         wdf_calls = _scan_wdf_calls(decomp)
         all_c = "\n".join(v for v in decomp.values() if v)
+        is_kmdf = ("WdfVersionBind" in symbols
+                   or bool(static.get("framework") in ("kmdf", "both")))
 
         # ---- (c) symbolic link reachability -----------------------------------
         sym_addrs = []
@@ -257,61 +325,84 @@ def main():
             sym_funcs |= _funcs_referencing(program, a)
         sym_func_names = sorted(f.getName() for f in sym_funcs)
 
-        # is the symlink-creating function reachable from DriverEntry? Walk UP
-        # the call graph (callers) from each symlink fn to the entry function —
-        # more robust than a downward callee walk, which misses calls Ghidra
-        # renders through a thunk or pointer.
+        # reachable from DriverEntry? walk UP (callers) from each symlink fn.
         symlink_in_entry_path = any(_reaches(f, entry) for f in sym_funcs)
 
-        # does the creation sit behind a PnP gate instead?
         pnp_gated = bool(_contains_any(all_c, _PNP_GATES)
                          or (symbols & set(_PNP_GATES)))
 
-        is_control_device = ("WdfControlDeviceInitAllocate" in wdf_calls
-                             or "WdfControlDeviceInitAllocate" in symbols)
+        # creates a symlink: WDM import, resolved WDF call, OR - the robust,
+        # framework-agnostic signal that survives CFG-guarded WDF dispatch - a
+        # reachable function references a \DosDevices\ / \?? symlink NAME string.
+        wdf_symlink = ("WdfDeviceCreateSymbolicLink" in wdf_calls
+                       or "WdfDeviceCreateSymbolicLink" in symbols)
         creates_symlink = bool(
-            (symbols & set(_SYMLINK_APIS_WDM))
-            or "WdfDeviceCreateSymbolicLink" in wdf_calls
-            or "WdfDeviceCreateSymbolicLink" in symbols)
+            (symbols & set(_SYMLINK_APIS_WDM)) or wdf_symlink
+            or symlink_in_entry_path
+            or (bool(sym_funcs) and (is_kmdf or bool(static.get("declares_symlink")))))
 
-        # SDDL: literal security descriptors in the image
-        sddl = sorted(s for s in strings if s.startswith("d:")
-                      and "(a;" in s)
-        sddl_grants_user = any(x in s for s in sddl
-                               for x in (";;;wd)", ";;;au)", ";;;iu)", ";;;bu)"))
+        # control device: resolved WdfControlDeviceInitAllocate, or inferred -
+        # a KMDF driver that creates a symlink from DriverEntry and is NOT behind
+        # a PnP gate is a control device (available at `sc start`, no hardware).
+        control_resolved = ("WdfControlDeviceInitAllocate" in wdf_calls
+                            or "WdfControlDeviceInitAllocate" in symbols)
+        control_inferred = bool(is_kmdf and symlink_in_entry_path and not pnp_gated)
+        is_control_device = bool(control_resolved or control_inferred)
+
+        # SDDL: Ghidra-defined strings, else the static byte-scan from index.py
+        # (the descriptor is often a raw .rdata constant Ghidra never typed).
+        sddl = sorted(s for s in strings if s.startswith("d:") and "(a;" in s)
+        sddl = [s.upper() for s in sddl]
+        sddl_src = "ghidra"
+        if not sddl and static.get("sddl"):
+            sddl = list(static.get("sddl"))
+            sddl_src = "static"
+        sddl_grants_user = any(x in s.upper() for s in sddl
+                               for x in (";;;WD)", ";;;AU)", ";;;IU)", ";;;BU)")) \
+            or bool(static.get("sddl_grants_user"))
 
         result["symlink"] = {
             "creates_symlink": creates_symlink,
-            "symlink_strings": sorted(set(sym_strings))[:20],
+            "symlink_strings": sorted(set(sym_strings)
+                                      or static.get("symlink_paths") or [])[:20],
             "created_by": sym_func_names[:20],
             "reachable_from_driver_entry": symlink_in_entry_path,
             "pnp_gated": pnp_gated,
             "is_control_device": is_control_device,
-            "sddl": [s.upper() for s in sddl][:10],
+            "control_inferred": control_inferred and not control_resolved,
+            "sddl": sddl[:10],
+            "sddl_source": sddl_src,
             "sddl_grants_user": sddl_grants_user,
         }
-        # verdict: available right after sc start, no hardware, user-openable
+        # verdict: created from DriverEntry (not PnP), reachable, user-openable.
         result["symlink_user_reachable"] = bool(
             creates_symlink and symlink_in_entry_path
             and (is_control_device or not pnp_gated)
             and sddl_grants_user)
 
-        # ---- (b) mouse injection ---------------------------------------------
-        mouse_str = _contains_any(all_c, _MOUSE_STRINGS) \
-            or [s for s in strings if _contains_any(s, _MOUSE_STRINGS)]
+        # ---- (b) input injection ---------------------------------------------
+        # mechanism 1: hook the mouse/keyboard class service callback
+        mouse_str = sorted(set(_contains_any(all_c, _MOUSE_STRINGS))
+                           | set(s for s in strings if _contains_any(s, _MOUSE_STRINGS)))
         connect_apis = [a for a in _CONNECT_APIS if a in symbols]
-        ioctl_hits = [hex(i) for i in _CONNECT_IOCTLS
-                      if ("%x" % i) in all_c.lower()]
-        # an indirect call near the class-service-callback material = the hook
+        ioctl_hits = [hex(i) for i in _CONNECT_IOCTLS if ("%x" % i) in all_c.lower()]
         indirect_call = "(**" in all_c or "(*(code *)" in all_c
-        inject = bool(mouse_str and (connect_apis or ioctl_hits) and indirect_call)
+        class_hook = bool(mouse_str and (connect_apis or ioctl_hits) and indirect_call)
+        # mechanism 2: virtual-HID device fed synthetic reports over IOCTL
+        vhid_str = sorted(set(s for s in strings if _contains_any(s, _VHID_STRINGS)))
+        vhid_inject = bool(vhid_str and creates_symlink)
+        inject = bool(class_hook or vhid_inject)
         result["mouse_injection"] = {
             "verdict": inject,
-            "class_strings": sorted(set(mouse_str))[:10],
+            "mechanism": ("class_callback_hook" if class_hook
+                          else "virtual_hid_ioctl" if vhid_inject else None),
+            "class_strings": mouse_str[:10],
             "connect_apis": connect_apis,
             "connect_ioctls": ioctl_hits,
             "indirect_call_present": indirect_call,
+            "vhid_strings": vhid_str[:10],
         }
+        result["callbacks_analysed"] = sorted(f.getName() for f in callbacks)[:20]
 
         # ---- raw evidence the analyst wants -----------------------------------
         result["wdf_calls"] = {k: sorted(set(v))[:12] for k, v in wdf_calls.items()}
@@ -377,10 +468,12 @@ def _write_report(report_dir, name_base, result, entry_c, decomp):
     mi = result.get("mouse_injection") or {}
     sl = result.get("symlink") or {}
     lines.append(_sep("VERDICTS"))
-    lines.append("(b) mouse injection            : %s" % mi.get("verdict"))
+    lines.append("(b) input injection            : %s" % mi.get("verdict"))
+    lines.append("      mechanism                : %s" % mi.get("mechanism"))
     lines.append("      class strings            : %s" % ", ".join(mi.get("class_strings") or []))
     lines.append("      connect apis             : %s" % ", ".join(mi.get("connect_apis") or []))
     lines.append("      connect ioctls           : %s" % ", ".join(mi.get("connect_ioctls") or []))
+    lines.append("      vhid strings             : %s" % ", ".join(mi.get("vhid_strings") or []))
     lines.append("      indirect call present    : %s" % mi.get("indirect_call_present"))
     lines.append("(c) symlink user-reachable     : %s" % result.get("symlink_user_reachable"))
     lines.append("      creates symlink          : %s" % sl.get("creates_symlink"))
@@ -388,9 +481,16 @@ def _write_report(report_dir, name_base, result, entry_c, decomp):
     lines.append("      created by               : %s" % ", ".join(sl.get("created_by") or []))
     lines.append("      reachable from DriverEntry: %s" % sl.get("reachable_from_driver_entry"))
     lines.append("      pnp gated                : %s" % sl.get("pnp_gated"))
-    lines.append("      is control device        : %s" % sl.get("is_control_device"))
-    lines.append("      sddl                     : %s" % " ".join(sl.get("sddl") or []))
+    lines.append("      is control device        : %s%s" % (
+        sl.get("is_control_device"), " (inferred)" if sl.get("control_inferred") else ""))
+    lines.append("      sddl [%s]              : %s" % (
+        sl.get("sddl_source"), " ".join(sl.get("sddl") or [])))
     lines.append("      sddl grants user         : %s" % sl.get("sddl_grants_user"))
+
+    cb = result.get("callbacks_analysed") or []
+    if cb:
+        lines.append("")
+        lines.append("WDF callbacks analysed: %s" % ", ".join(cb))
 
     wdf = result.get("wdf_calls") or {}
     if wdf:

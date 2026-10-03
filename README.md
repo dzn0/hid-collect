@@ -271,9 +271,20 @@ reports/<sha256>/
 
 It also appends a compact `kind:"disasm"` line to the store index (so
 `query --injects` / `--symlink-reachable` work) and refreshes the lean index.
+
+Injection (b) is detected for both mechanisms: hooking the mouse/keyboard class
+service callback, and a virtual-HID device fed synthetic reports over IOCTL
+(`mechanism: class_callback_hook | virtual_hid_ioctl`). CFG-guarded KMDF routes
+every WDF call through `_guard_dispatch_icall`, so the symlink/control-device
+verdict is framework-agnostic (a symlink-name string referenced from a function
+reachable from `DriverEntry`, not behind a PnP gate) and falls back to the
+byte-level `device` signals (SDDL, declared paths) from the index when Ghidra
+cannot type them. WDF-registered callbacks (EvtIoDeviceControl, …) are seeded
+into the decompiled set so the IOCTL/injection logic is analysed, not just the
+`DriverEntry` callee tree.
+
 Static reachability is strong evidence, not proof — final (c) confirmation is a
-dynamic load in an isolated VM. The WDF index→name map in `DriverTriage.py` is
-version-sensitive; unknown indices are reported with their raw number.
+dynamic load in an isolated VM.
 
 ## Lean index — `reports/index.jsonl`
 

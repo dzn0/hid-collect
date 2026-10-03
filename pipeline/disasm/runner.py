@@ -47,26 +47,31 @@ def _name_base(rec: dict, sha: str) -> str:
 
 
 def analyze_driver(sys_path: Path, ghidra: Path, *, report_dir: Path | None = None,
-                   name_base: str = "driver", timeout: int = 600) -> dict:
+                   name_base: str = "driver", static_device: dict | None = None,
+                   timeout: int = 600) -> dict:
     """Run Ghidra headless on one .sys and return the DriverTriage findings dict.
 
     Creates a throwaway project per binary (keeps runs independent and lets the
     caller parallelise later), points the post-script at a temp JSON file, and
     parses it back. When ``report_dir`` is given the post-script also writes the
-    human artifacts (disassembly.txt, <name_base>-driver-entry.c) there. On any
-    failure returns ``{"ok": False, "error": ...}`` — disassembly must never sink
-    the pipeline.
+    human artifacts (disassembly.txt, <name_base>-driver-entry.c) there.
+    ``static_device`` is the byte-level `device` dict from the index; it is handed
+    to the post-script as a fallback for evidence Ghidra misses on CFG-guarded
+    KMDF (SDDL, declared symlink paths). On any failure returns
+    ``{"ok": False, "error": ...}`` — disassembly must never sink the pipeline.
     """
     sha = sys_path.stem
     with tempfile.TemporaryDirectory(prefix="ghidra_") as tmp:
         tmpd = Path(tmp)
         out_json = tmpd / "triage.json"
+        static_json = tmpd / "static.json"
+        static_json.write_text(json.dumps(static_device or {}), encoding="utf-8")
         cmd = [
             str(ghidra), str(tmpd), f"proj_{sha[:12]}",
             "-import", str(sys_path),
             "-scriptPath", str(_SCRIPT_DIR),
             "-postScript", _SCRIPT, str(out_json),
-            str(report_dir or ""), name_base,
+            str(report_dir or ""), name_base, str(static_json),
             "-analysisTimeoutPerFile", str(max(30, timeout - 30)),
             "-deleteProject",
         ]
@@ -165,7 +170,9 @@ def main(argv: list[str] | None = None) -> int:
 
         t0 = time.monotonic()
         findings = analyze_driver(sys_path, ghidra, report_dir=report_dir,
-                                  name_base=name_base, timeout=args.timeout)
+                                  name_base=name_base,
+                                  static_device=rec.get("device"),
+                                  timeout=args.timeout)
         ran += 1
         # keep a compact verdict in the index so query --injects/--symlink-reachable work
         verdict = {k: findings.get(k) for k in
