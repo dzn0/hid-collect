@@ -86,6 +86,35 @@ Re-running resumes from both the discovery cache (brand walk reused when
 ≤ `PDT_HID_DISCOVERY_TTL_DAYS` old, default 7) and the per-URL ledger
 (`processed.jsonl`).
 
+## Brand filtering
+
+The aggregator classifies brands by *site category* (keyboard, mouse, tablet,
+gamepad), but the classification is noisy — Panasonic, Samsung, HP, Creative,
+M-Audio, Wacom, Fanatec, Elgato and friends sit under one of those categories
+for incidental products and dominate the raw crawl (Samsung alone shipped 243
+drivers to the corpus; none has a HID-input primitive). To steer the net toward
+the actual target, two env vars apply **after discovery** (so changing them is
+cheap — no re-walk):
+
+- `PDT_HID_BRAND_DENY` — comma/semicolon list of substrings, case-insensitive;
+  the default removes the chronic off-target vendors (audio, print, modem,
+  monitor, sim-racing wheels, VR, stream capture). Overriding replaces the
+  default entirely — pass an empty value to disable denylisting.
+- `PDT_HID_BRAND_ALLOW` — if set, keep only brands whose name contains one of
+  these substrings; otherwise keep everything the deny filter did not drop.
+
+Default `DENY` turns 7796 discovered packages into ~5200 (93 mouse/kbd/gamepad
+brands: Microsoft, Logitech, Razer, SteelSeries, CORSAIR, HyperX, ROCCAT,
+Mad Catz, Saitek, Cooler Master, Wooting, CHERRY, Ducky, Pulsar, Mountain,
+Mionix, Fnatic, Kensington, Endgame Gear, ZOWIE, Dygma, MonsGeek, Akko, …).
+A tight mouse+keyboard-only run drops gamepad category too:
+
+```bash
+PDT_HID_CATEGORIES=10,11 \
+PDT_HID_BRAND_ALLOW="razer,logitech,corsair,steelseries,hyperx,roccat,wooting,glorious,cherry,ducky,pulsar,mountain,akko,mionix,fnatic,endgame,zowie,kensington,dygma,monsgeek,obins,melgeek,kemove,klim,drevo,tesoro,viper,havit,alienware,g.skill,msi,asus,aorus,evga,cougar,mad catz,bloody" \
+docker compose run --rm run
+```
+
 ## Query — `pipeline.query`
 
 `index.jsonl` is dense, single-line JSON per driver — meant for a machine, not
@@ -137,6 +166,8 @@ Set before `docker compose run`:
 | `PDT_HID_JOBS`               | `6`            | Parallel download workers             |
 | `PDT_HID_CRAWL_JOBS`         | `8`            | Parallel discovery crawlers           |
 | `PDT_HID_MAX_MB`             | `60`           | Per-package size cap                  |
+| `PDT_HID_BRAND_ALLOW`        | *(unset)*      | If set, keep only matching brands     |
+| `PDT_HID_BRAND_DENY`         | *(curated)*    | Drops off-target brands               |
 | `PDT_HID_REFRESH=1`          | off            | Ignore resume ledger                  |
 | `PDT_HID_REFRESH_DISCOVERY=1`| off            | Ignore discovery cache, re-walk       |
 | `PDT_HID_DISCOVERY_TTL_DAYS` | `7`            | Cache lifetime                        |

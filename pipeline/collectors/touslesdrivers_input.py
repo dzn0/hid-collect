@@ -52,6 +52,18 @@ Environment knobs:
 - `PDT_HID_REFRESH=1`                             ignore download resume ledger
 - `PDT_HID_DISCOVERY_TTL_DAYS` (int)              default: 7 (cache discovery)
 - `PDT_HID_REFRESH_DISCOVERY=1`                   ignore discovery cache, re-walk
+- `PDT_HID_BRAND_ALLOW` (`,`/`;` substrings, CI)  if set, keep only matching brands
+- `PDT_HID_BRAND_DENY`  (`,`/`;` substrings, CI)  always applied; drops matching brands
+                                                  (default: see `_DEFAULT_BRAND_DENY`)
+
+Brand filters apply AFTER discovery so a stable cache powers many different
+runs. The site classifies brands by category (kbd/mouse/tablet/gamepad), but
+that classification is noisy — e.g. Panasonic / Samsung / HP / Creative sit in
+`kbd+mouse+gamepad` for incidental products. The default `PDT_HID_BRAND_DENY`
+removes the chronic off-target vendors so the corpus skews toward the real
+target (drivers that look able to inject synthetic mouse/kbd input). Set
+`PDT_HID_BRAND_ALLOW` to narrow further; see the README's "Brand filtering"
+section for a mouse/keyboard-focused allowlist.
 """
 from __future__ import annotations
 import collections
@@ -249,6 +261,83 @@ RX_FILE  = re.compile(
 JUNK = re.compile(r"(linux|cleaner|setup_cleaner|mac_?os|android|chromeos)", re.I)
 
 
+# Brands whose products are almost never a HID peripheral in the mouse/keyboard
+# sense, yet sit under v_categorie=10/11/17/19 by incidental classification:
+# audio interfaces, print+scan, modems, phones, monitors, camera/stream capture,
+# sim-racing wheels/pedals (gamepad-adjacent, not mouse/kbd), VR headsets. Each
+# one has been verified against the site's current archive to belong here.
+# Users override with PDT_HID_BRAND_DENY (replace entirely; comma-separated).
+_DEFAULT_BRAND_DENY: tuple[str, ...] = (
+    "panasonic", "samsung", "sony", "hp", "hewlett-packard",
+    "creative", "m-audio", "fiio", "e-mu", "terratec", "infrasonic",
+    "casio", "jammate", "iriver", "blackmagic design",
+    "viewsonic", "aoc", "benq", "aopen",
+    "wacom", "xppen", "3dconnexion", "synaptics", "authentec",
+    "upek", "digitalpersona", "evoluent", "penclic", "goldtouch",
+    "fanatec", "thrustmaster", "simagic", "simucube", "moza",
+    "asetek", "cammus", "bavariansimtec", "p1sim", "ugt",
+    "meta quest", "oculus",
+    "elgato", "turtle beach", "astro",
+)
+
+
+def _env_str_list(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    items = [s.strip().lower() for s in re.split(r"[;,]", raw) if s.strip()]
+    return tuple(items)
+
+
+def _brand_allow_patterns() -> tuple[str, ...]:
+    """Allowlist substrings; empty tuple means 'no allowlist, keep everything'."""
+    return _env_str_list("PDT_HID_BRAND_ALLOW", ())
+
+
+def _brand_deny_patterns() -> tuple[str, ...]:
+    """Denylist substrings; defaults curated for the mouse/kbd target."""
+    return _env_str_list("PDT_HID_BRAND_DENY", _DEFAULT_BRAND_DENY)
+
+
+def _brand_passes(brand_name: str, allow: tuple[str, ...],
+                  deny: tuple[str, ...]) -> bool:
+    low = (brand_name or "").lower()
+    if deny and any(d in low for d in deny):
+        return False
+    if allow and not any(a in low for a in allow):
+        return False
+    return True
+
+
+def _filter_urls_by_brand(urls: list[str], url_source: dict[str, dict],
+                          allow: tuple[str, ...], deny: tuple[str, ...]
+                          ) -> tuple[list[str], dict[str, int]]:
+    """Drop URLs whose brand fails the allow/deny filter.
+
+    Returns (kept_urls, stats) where stats breaks down the drops so a run can
+    report how aggressive the filter was. Preserves input order (round-robin by
+    brand runs AFTER this), so the filtered list stays reproducible.
+    """
+    kept: list[str] = []
+    dropped = collections.Counter()
+    for url in urls:
+        src = url_source.get(url) or {}
+        brand = src.get("brand_name") or ""
+        if _brand_passes(brand, allow, deny):
+            kept.append(url)
+        else:
+            dropped[brand] += 1
+    stats = {
+        "allow_patterns": list(allow),
+        "deny_patterns": list(deny),
+        "kept": len(kept),
+        "dropped": sum(dropped.values()),
+        "brands_dropped": len(dropped),
+        "top_dropped_brands": dropped.most_common(10),
+    }
+    return kept, stats
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "") or default)
@@ -400,16 +489,22 @@ class TousLesDriversInputCollector(Collector):
         p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     def discover(self) -> dict:
+        allow = _brand_allow_patterns()
+        deny = _brand_deny_patterns()
+
         # Fast path: load cached discovery if fresh.
         cached = self._load_discovery_cache()
         if cached is not None:
             all_urls = list(cached["urls"])
             self._url_source = dict(cached["url_source"])
-            # Re-apply brand-stratified ordering even on cache hit: older cache
-            # entries may have been saved flat (before the stratification fix),
-            # and the ordering costs nothing to recompute.
-            all_urls = _round_robin_by_brand(all_urls, self._url_source)
-            self._urls = all_urls[: self.max_packs] if self.max_packs else all_urls
+            # Apply brand filter BEFORE stratification: round-robin needs a
+            # final set to spread evenly, and max_packs should bite the kept
+            # pool. Filtering runs on each call (not stored in cache), so a
+            # user can tune ALLOW/DENY without re-walking 7796 URLs.
+            kept_urls, filt_stats = _filter_urls_by_brand(
+                all_urls, self._url_source, allow, deny)
+            kept_urls = _round_robin_by_brand(kept_urls, self._url_source)
+            self._urls = kept_urls[: self.max_packs] if self.max_packs else kept_urls
             info = dict(cached["info"])
             info["discovery_cache"] = {
                 "hit": True,
@@ -418,7 +513,9 @@ class TousLesDriversInputCollector(Collector):
                 "used_url_count": len(self._urls),
                 "path": str(self._discovery_cache_path()),
             }
-            progress.report(f"discovery cache hit: {len(self._urls)}/{len(all_urls)} pkg URLs loaded")
+            info["brand_filter"] = filt_stats
+            progress.report(f"discovery cache hit: {len(self._urls)}/{len(all_urls)} pkg URLs "
+                            f"(brand filter dropped {filt_stats['dropped']})")
             return info
 
         # --- Step 1: brand pool from the 4 category indexes --------------------
@@ -491,12 +588,7 @@ class TousLesDriversInputCollector(Collector):
                         "v_type": vtype,
                     }
                 progress.report(f"popups: {done}/{total_pkgs} · {len(urls)} direct URLs so far")
-        # Stratify by brand so download workers don't cluster on one vendor's
-        # fat-installer monoculture — see _round_robin_by_brand docstring.
-        urls = _round_robin_by_brand(urls, url_source)
-        self._urls = urls
         self._url_source = url_source
-        progress.report(f"discovered {len(urls)} package(s)")
 
         info = {
             "discovery_page": BASE + "/",
@@ -511,11 +603,20 @@ class TousLesDriversInputCollector(Collector):
             "jobs": self.jobs,
             "max_mb": self.max_mb,
         }
-        # Persist for next run (resumable discovery). Save BEFORE max_packs
-        # trimming so caps are reapplied per-run without poisoning the cache.
+        # Persist the FULL universe (pre-filter, pre-stratify) so a user can
+        # change ALLOW/DENY later without re-walking the site. max_packs and
+        # the brand filter are run-time preferences, not discovery outputs.
         self._save_discovery_cache(info, urls, url_source)
-        if self.max_packs:
-            self._urls = urls[: self.max_packs]
+
+        # Apply brand filter, then stratify by brand so download workers don't
+        # cluster on one vendor's fat-installer monoculture — see
+        # _round_robin_by_brand docstring.
+        kept, filt_stats = _filter_urls_by_brand(urls, url_source, allow, deny)
+        kept = _round_robin_by_brand(kept, url_source)
+        self._urls = kept[: self.max_packs] if self.max_packs else kept
+        progress.report(f"discovered {len(urls)} package(s); brand filter kept "
+                        f"{filt_stats['kept']}, dropped {filt_stats['dropped']}")
+        info["brand_filter"] = filt_stats
         info["discovery_cache"] = {
             "hit": False,
             "saved_at": C.utc_now(),
