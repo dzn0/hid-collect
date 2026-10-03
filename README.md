@@ -5,6 +5,14 @@ HID peripherals — keyboard, mouse, graphics tablet, gamepad — from the
 touslesdrivers.com aggregator. Deduplicates by SHA-256 and stores to a
 content-addressed drive.
 
+**Goal.** The net is drivers that ship with HID peripherals; the *target* is the
+subset that looks able to **inject synthetic mouse/keyboard input from user mode,
+bypassing the legitimate HID stack** — the primitive behind input-spoofing /
+aim-assist abuse, and the kind of vulnerable signed driver LOLDrivers tracks.
+Every binary gets an `hid_input` score + bucket (`strong`/`candidate`/`weak`/
+`none`) and a LOLDrivers cross-reference so that subset is scannable — see
+[Index](#index--driversindexjsonl) and [Query](#query--pipelinequery).
+
 **Collection only.** No signature verification, no fingerprint, no scope
 profiles, no analyze stage. If you need triage downstream, feed
 `pipeline_out/drivers/` into the parent `hid-driver-triage` repo.
