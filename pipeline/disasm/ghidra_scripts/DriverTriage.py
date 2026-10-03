@@ -1,14 +1,15 @@
-# DriverTriage.py — Ghidra headless post-script (Jython / GhidraScript API).
+# -*- coding: utf-8 -*-
+# DriverTriage.py - Ghidra headless post-script (Jython / GhidraScript API).
 #
 # Runs after auto-analysis under `analyzeHeadless ... -postScript DriverTriage.py
 # <out.json>`. It answers the two questions byte-parsing cannot, by actually
 # following code:
 #
-#   (b) mouse-movement injection — is there a reachable call that drives the
+#   (b) mouse-movement injection - is there a reachable call that drives the
 #       mouse class service callback (MouseClassServiceCallback / the
 #       IOCTL_INTERNAL_MOUSE_CONNECT hook), i.e. synthetic input bypassing HID?
 #
-#   (c) user-reachable symlink — is the device + symbolic link created from
+#   (c) user-reachable symlink - is the device + symbolic link created from
 #       DriverEntry (available right after `sc start`, no PnP/hardware), and is
 #       its security descriptor openable by a non-admin process?
 #
@@ -24,7 +25,7 @@
 # (the runner drops <name_base>.sys next to them). The JSON carries the same
 # verdicts plus the symlink-referencing functions and their callers.
 #
-# This is static reachability, not execution — strong evidence, not proof; final
+# This is static reachability, not execution - strong evidence, not proof; final
 # (c) confirmation is a dynamic load in an isolated VM. WDF index->name mapping
 # is version-sensitive (see _WDF_FUNCTIONS); unknown indices are reported raw.
 #
@@ -89,12 +90,12 @@ def _entry_function(program):
             f = fm.getFunctionAt(s.getAddress())
             if f is not None:
                 return f
-    # fall back to the PE entry point
-    ep = program.getImageBase().add(
-        program.getOptions("Program Information").getLong("Entry Point", 0))
-    f = fm.getFunctionContaining(ep)
-    if f is not None:
-        return f
+    # the PE entry point: Ghidra flags it as an external entry point and names
+    # the function `entry`. This is the function other code's callers resolve to.
+    for addr in st.getExternalEntryPointIterator():
+        f = fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
+        if f is not None:
+            return f
     # last resort: the first function the analyzer found at the entry
     it = fm.getFunctions(True)
     return it.next() if it.hasNext() else None
@@ -186,6 +187,28 @@ def _scan_wdf_calls(decomp_by_name):
     return found
 
 
+def _reaches(target, root, limit=4000):
+    """True if `target` is `root`, or `root` transitively calls `target`.
+
+    Walks callers upward from `target`; robust to thunk/pointer calls that a
+    downward getCalledFunctions walk from `root` can miss.
+    """
+    root_addr = root.getEntryPoint()
+    seen = set()
+    stack = [target]
+    while stack and len(seen) < limit:
+        fn = stack.pop()
+        a = fn.getEntryPoint()
+        if a in seen:
+            continue
+        seen.add(a)
+        if a == root_addr:
+            return True
+        for c in fn.getCallingFunctions(MONITOR):
+            stack.append(c)
+    return False
+
+
 def _contains_any(text, needles):
     low = text.lower()
     return [n for n in needles if n.lower() in low]
@@ -234,9 +257,11 @@ def main():
             sym_funcs |= _funcs_referencing(program, a)
         sym_func_names = sorted(f.getName() for f in sym_funcs)
 
-        # is the symlink-creating function reachable from DriverEntry?
-        reach_names = set(decomp.keys())
-        symlink_in_entry_path = any(f.getName() in reach_names for f in sym_funcs)
+        # is the symlink-creating function reachable from DriverEntry? Walk UP
+        # the call graph (callers) from each symlink fn to the entry function —
+        # more robust than a downward callee walk, which misses calls Ghidra
+        # renders through a thunk or pointer.
+        symlink_in_entry_path = any(_reaches(f, entry) for f in sym_funcs)
 
         # does the creation sit behind a PnP gate instead?
         pnp_gated = bool(_contains_any(all_c, _PNP_GATES)

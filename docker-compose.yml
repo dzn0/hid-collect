@@ -21,6 +21,8 @@ x-hc-common: &hc-common
   build: .
   volumes:
     - ./pipeline_out:/work/pipeline_out
+    # Per-driver disasm reports + the lean index land here (triage / disasm).
+    - ./reports:/work/reports
     # Overlay the Python package from the host so edits don't need a rebuild.
     - ./pipeline:/work/pipeline
 
@@ -78,7 +80,10 @@ services:
   #   docker compose run --rm triage --require prod-cert --apply
   triage:
     <<: *hc-common
-    command: ["pipeline.triage"]
+    # entrypoint fixed to the module so `run --rm triage --target` passes flags
+    # straight through (compose run replaces `command`, but appends after entrypoint)
+    entrypoint: ["python", "-m", "pipeline.triage"]
+    command: []
 
   # Disassembly stage: Ghidra headless follows DriverEntry to decide mouse
   # injection (b) and user-reachable symlink (c). Heavy — needs the Ghidra image:
@@ -94,7 +99,8 @@ services:
       context: .
       args:
         WITH_GHIDRA: "1"
-    command: ["pipeline.disasm"]
+    entrypoint: ["python", "-m", "pipeline.disasm"]
+    command: []
 
   tight:
     <<: *hc-common
