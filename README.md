@@ -36,15 +36,35 @@ every new `.sys`**. As a binary is stored, collection appends one *analysis*
 line, and once origin is known it appends *provenance* line(s). Each line is a
 JSON object keyed by `sha256`:
 
-- **analysis** — `pe` infos (arch, subsystem, timestamp, imphash), imported APIs
-  (`pe.imports` grouped by DLL + `pe.dangerous_imports`), extracted ASCII/UTF-16
-  `strings`, plus `original_name`, `size`, `extraction_path`
+- **analysis** — everything derivable from the bytes:
+  - **hashes** — `sha256`, `md5`, `sha1`, `pe.imphash`, file + per-section entropy
+  - **pe** — arch, subsystem, `is_driver` flag, timestamp, linker, image base,
+    entrypoint, checksum (+validity), characteristics, DLL characteristics
+    (NX, ASLR, CFG), data directories
+  - **sections** — name, VA, size, perms, entropy, `wx` flag
+  - **apis** — `imports` grouped by DLL, `exports`, `api_count`,
+    `dangerous_imports`, `capabilities` buckets (`input_injection`,
+    `phys_mem`, `msr_control_reg`, `port_io`, `process_access`, `mem_copy`,
+    `device_io`)
+  - **debug** — CodeView PDB path, GUID, age (original build identity)
+  - **resources** — manifest/RCDATA presence, `version_info` (CompanyName,
+    OriginalFilename, FileVersion, …)
+  - **signature** — embedded Authenticode presence + certificate common names
+  - **overlay** — appended data (offset, size, entropy)
+  - **strings** — deduped ASCII/UTF-16 + `interesting_strings`
+    (device paths, registry, GUIDs, URLs, other `.sys`)
+  - **hid_input** — score + bucket (`strong`/`candidate`/`weak`/`none`) for the
+    project's question: does this driver look able to inject mouse/keyboard
+    input from user mode, bypassing the legitimate HID stack?
+  - **loldrivers** — cross-reference against a vendored LOLDrivers snapshot
+    (`pipeline/refs/loldrivers_index.json`, matched by sha256 then imphash)
 - **provenance** — `{"sha256", "provenance": {...}}` (brand, package URL, …)
 
 A reader folds every line sharing a `sha256`; `pipeline.index.fold_index()` does
-this. Binaries are parsed **as bytes only** — nothing is executed. `original_name`
-is not recoverable from the bytes, so it is present only for binaries stored
-after the index existed.
+this. Binaries are parsed **as bytes only** — nothing is executed, nothing is
+disassembled. `original_name` is not recoverable from the bytes alone, so it is
+present only for binaries stored after the index existed (version-info's
+`OriginalFilename` is a reliable fallback).
 
 Appending happens automatically during collection. To (re)build analysis lines
 for binaries already in the store — e.g. after a reset or an interrupted run:

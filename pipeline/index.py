@@ -3,31 +3,40 @@
 The content-addressed store (`pipeline_out/drivers/<sha256>.sys`) is a flat tree
 of hash-named binaries. `index.jsonl` is the single, append-only index kept
 alongside it: as each new binary is stored, collection appends one *analysis*
-line describing it, and later one or more *provenance* lines once origin is
-known. Nothing is executed — binaries are parsed purely as bytes.
+line, and later one or more *provenance* lines once origin is known. Nothing is
+executed — binaries are parsed purely as bytes (no disassembly, no emulation).
 
-A line is a JSON object keyed by `sha256`. Analysis lines carry:
+Each analysis line is a JSON object keyed by `sha256` carrying everything useful
+for triage and reverse-engineering that can be read statically:
 
-  * **infos**  — PE identity: machine/arch, subsystem, timestamp, imphash, size,
-                 original_name, extraction_path
-  * **apis**   — every imported symbol, grouped by DLL plus a flagged
-                 driver-abuse subset
-  * **strings** — deduped ASCII and UTF-16LE strings
+  * **hashes**  — md5, sha1, imphash, file + per-section entropy
+  * **pe**      — machine/arch, subsystem, timestamp, linker, image base, entry
+                  point, checksum (+validity), image/DLL characteristics (NX,
+                  ASLR, CFG), data directories, sections (perms + entropy)
+  * **apis**    — imports grouped by DLL, capability buckets, dangerous subset,
+                  exports
+  * **debug**   — CodeView PDB path + GUID/age (original build path)
+  * **version** — VS_VERSIONINFO (company, product, original filename, versions)
+  * **signature** — embedded Authenticode presence + certificate common names
+  * **strings** — deduped ASCII/UTF-16 plus a curated interesting subset
+                  (device paths, registry keys, GUIDs, URLs, other .sys)
+  * **hid_input** — a signal set + score for the project's question: does this
+                  driver look able to inject mouse/keyboard input from user mode,
+                  bypassing the legitimate HID stack?
+  * **loldrivers** — cross-reference against a vendored LOLDrivers snapshot
 
-Provenance lines carry `{"sha256", "provenance": {...}}`. A reader folds every
-line sharing a `sha256` to get the full record (see `fold_index`).
-
-This module also provides `analyze_binary()` (used by the collectors at store
-time) and a CLI that backfills analysis lines for any `.sys` already in the
-store that is missing one — useful after a reset or an interrupted run:
+A reader folds every line sharing a `sha256` (see `fold_index`). This module also
+exposes `analyze_binary()` (used by the collectors at store time) and a CLI that
+backfills analysis lines for `.sys` already in the store:
 
     python -m pipeline.index            # append missing analysis lines
-    python -m pipeline.index --rebuild  # drop + rebuild all analysis lines
+    python -m pipeline.index --rebuild  # drop + re-emit all analysis lines
 """
 from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import struct
 import sys
@@ -36,146 +45,467 @@ from pathlib import Path
 from . import config
 from .collectors import _common as C
 
-_MACHINE = {0x014c: "x86", 0x8664: "x64", 0xAA64: "arm64", 0x01c0: "arm", 0x01c4: "armnt"}
-_SUBSYSTEM = {0: "unknown", 1: "native", 2: "gui", 3: "console"}
+_REFS = Path(__file__).resolve().parent / "refs"
 
-# Imports worth surfacing: the primitives kernel-driver exploits lean on
-# (physical memory, MSR/CR, port I/O, process handles, arbitrary copies). Not a
-# verdict — just a flag so the index is scannable. Matched case-insensitively.
-_DANGEROUS = {
-    "mmmapiospace", "mmmapiospaceex", "mmunmapiospace", "mmgetphysicaladdress",
-    "zwmapviewofsection", "zwopensection", "mmcopymemory", "mmcopyvirtualmemory",
-    "__readmsr", "__writemsr", "__readcr", "__writecr0", "__writecr3", "__writecr4",
-    "__inbyte", "__inword", "__indword", "__outbyte", "__outword", "__outdword",
-    "halgetbusdatabyoffset", "halsetbusdatabyoffset", "pssetloadimagenotifyroutine",
-    "pslookupprocessbyprocessid", "obopenobjectbypointer", "obreferenceobjectbyhandle",
-    "kestackattachprocess", "zwdeviceiocontrolfile", "mmmaplockedpagesspecifycache",
-    "iocreatesymboliclink", "iocreatedevice", "rtlcopymemory", "memcpy",
+_MACHINE = {0x014c: "x86", 0x8664: "x64", 0xAA64: "arm64", 0x01c0: "arm", 0x01c4: "armnt",
+            0x0200: "ia64"}
+_SUBSYSTEM = {0: "unknown", 1: "native", 2: "gui", 3: "console", 9: "wince", 14: "xbox"}
+
+_CHARACTERISTICS = {
+    0x0002: "executable", 0x0020: "large_address_aware", 0x2000: "dll",
+    0x1000: "system", 0x0001: "relocs_stripped",
+}
+_DLLCHARS = {
+    0x0040: "dynamic_base", 0x0080: "force_integrity", 0x0100: "nx_compat",
+    0x0200: "no_isolation", 0x0400: "no_seh", 0x0800: "no_bind",
+    0x1000: "appcontainer", 0x2000: "wdm_driver", 0x4000: "guard_cf",
+    0x8000: "terminal_server_aware", 0x0020: "high_entropy_va",
+}
+_DD_NAMES = ["export", "import", "resource", "exception", "security", "basereloc",
+             "debug", "arch", "globalptr", "tls", "load_config", "bound_import",
+             "iat", "delay_import", "clr", "reserved"]
+
+# Imports worth surfacing: primitives kernel-driver exploits lean on. Not a
+# verdict — a flag so the index is scannable. Matched case-insensitively.
+_CAPABILITIES = {
+    "input_injection": {"mouseclassservicecallback", "mouclassservicecallback",
+                        "keyboardclassservicecallback", "kbdclassservicecallback"},
+    "phys_mem": {"mmmapiospace", "mmmapiospaceex", "mmgetphysicaladdress",
+                 "mmmaplockedpagesspecifycache", "zwmapviewofsection", "zwopensection",
+                 "mmcopymemory"},
+    "msr_control_reg": {"__readmsr", "__writemsr", "__readcr", "__writecr0",
+                        "__writecr3", "__writecr4", "__readcr3"},
+    "port_io": {"__inbyte", "__outbyte", "__inword", "__outword", "__indword",
+                "__outdword", "halgetbusdatabyoffset", "halsetbusdatabyoffset",
+                "readportuchar", "writeportuchar"},
+    "process_access": {"pslookupprocessbyprocessid", "pssetloadimagenotifyroutine",
+                       "pssetcreateprocessnotifyroutine", "obopenobjectbypointer",
+                       "kestackattachprocess", "zwopenprocess", "zwterminateprocess",
+                       "zwprotectvirtualmemory"},
+    "mem_copy": {"memcpy", "memmove", "rtlcopymemory", "rtlmovememory"},
+    "device_io": {"iocreatedevice", "iocreatesymboliclink", "ioattachdevicetodevicestack",
+                  "iogetdeviceobjectpointer", "obreferenceobjectbyname",
+                  "iocreatedevicesecure", "wdmlibiocreatedevicesecure"},
+}
+_DANGEROUS = set().union(*_CAPABILITIES.values())
+
+# ---- the project's actual question: user-mode -> mouse/keyboard, no HID stack --
+_HID_STRING_SIGNALS = {
+    "mouseclassservicecallback": 5, "mouclassservicecallback": 5,
+    "keyboardclassservicecallback": 5, "kbdclassservicecallback": 5,
+    "\\driver\\mouclass": 4, "\\driver\\kbdclass": 4,
+    "\\device\\pointerclass": 4, "\\device\\keyboardclass": 4,
+    "mouse_input_data": 3, "keyboard_input_data": 3,
+    "mouclass": 2, "kbdclass": 2, "pointerclass": 2, "keyboardclass": 2,
+    "mouhid": 2, "kbdhid": 2, "hidclass": 1, "\\device\\rawinput": 2,
+}
+_HID_IMPORT_SIGNALS = {
+    "iocreatedevice", "iocreatesymboliclink", "ioattachdevicetodevicestack",
+    "iogetdeviceobjectpointer", "obreferenceobjectbyname",
+}
+_HID_CLASS_GUIDS = {
+    "4d36e96f-e325-11ce-bfc1-08002be10318": "GUID_CLASS_MOUSE",
+    "4d36e96b-e325-11ce-bfc1-08002be10318": "GUID_CLASS_KEYBOARD",
+    "378de44c-56ef-11d1-bc8c-00a0c91405dd": "GUID_DEVINTERFACE_MOUSE",
+    "884b96c3-56ef-11d1-bc8c-00a0c91405dd": "GUID_DEVINTERFACE_KEYBOARD",
+    "4d1e55b2-f16f-11cf-88cb-001111000030": "GUID_DEVINTERFACE_HID",
+    "745a17a0-74d3-11d0-b6fe-00a0c90f57da": "HIDClass",
 }
 
 _ASCII_PAT = rb"[\x20-\x7e]{%d,}"
 _UTF16_PAT = rb"(?:[\x20-\x7e]\x00){%d,}"
+_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_SYS_RE = re.compile(r"[\w\-]{1,64}\.sys", re.I)
+_URL_RE = re.compile(r"https?://[^\s\"'<>]{4,200}")
+
+_LOL: dict | None = None
 
 
-# ---------------------------------------------------------------- PE parsing
+# ---------------------------------------------------------------- small utils
 
 
-def _cstr(data: bytes, off: int, limit: int = 256) -> str:
+def _entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    hist = [0] * 256
+    for b in data:
+        hist[b] += 1
+    n = len(data)
+    h = 0.0
+    for c in hist:
+        if c:
+            p = c / n
+            h -= p * math.log2(p)
+    return round(h, 3)
+
+
+def _cstr(data: bytes, off: int, limit: int = 512) -> str:
     end = data.find(b"\x00", off, off + limit)
     if end < 0:
         end = min(off + limit, len(data))
     return data[off:end].decode("ascii", "replace")
 
 
-def _rva_to_off(rva: int, sections: list[tuple[int, int, int, int]]) -> int | None:
-    for va, vsize, raw_ptr, raw_size in sections:
-        span = max(vsize, raw_size)
-        if va <= rva < va + span:
-            return raw_ptr + (rva - va)
-    return None
+# ------------------------------------------------------------------- PE model
 
 
-def pe_info(data: bytes) -> dict | None:
-    """Parse a PE's headers and import table from bytes. None if not a PE."""
-    try:
+class PE:
+    """Minimal, defensive PE parser over an in-memory image (no execution)."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.ok = False
+        self.sections: list[dict] = []
+        self.dirs: list[tuple[int, int]] = []
         if data[:2] != b"MZ":
-            return None
-        pe = struct.unpack_from("<I", data, 0x3C)[0]
-        if data[pe:pe + 4] != b"PE\0\0":
-            return None
-        coff = pe + 4
-        machine, nsec = struct.unpack_from("<HH", data, coff)
-        timestamp = struct.unpack_from("<I", data, coff + 4)[0]
-        opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+            return
+        self.pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[self.pe:self.pe + 4] != b"PE\0\0":
+            return
+        coff = self.pe + 4
+        self.machine, self.nsec = struct.unpack_from("<HH", data, coff)
+        self.timestamp = struct.unpack_from("<I", data, coff + 4)[0]
+        self.opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+        self.characteristics = struct.unpack_from("<H", data, coff + 18)[0]
         opt = coff + 20
-        magic = struct.unpack_from("<H", data, opt)[0]
-        plus = magic == 0x20b
-        subsystem = struct.unpack_from("<H", data, opt + 68)[0]
-        dd_off = opt + (112 if plus else 96)
-        n_dd = struct.unpack_from("<I", data, opt + (108 if plus else 92))[0]
-        import_rva = 0
-        if n_dd > 1:
-            import_rva = struct.unpack_from("<I", data, dd_off + 8)[0]
-
-        sec_off = opt + opt_size
-        sections: list[tuple[int, int, int, int]] = []
-        for i in range(nsec):
+        self.opt = opt
+        self.magic = struct.unpack_from("<H", data, opt)[0]
+        self.plus = self.magic == 0x20b
+        self.linker = (data[opt + 2], data[opt + 3])
+        self.entrypoint = struct.unpack_from("<I", data, opt + 16)[0]
+        if self.plus:
+            self.image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+        else:
+            self.image_base = struct.unpack_from("<I", data, opt + 28)[0]
+        self.checksum = struct.unpack_from("<I", data, opt + 64)[0]
+        self.subsystem = struct.unpack_from("<H", data, opt + 68)[0]
+        self.dllchars = struct.unpack_from("<H", data, opt + 70)[0]
+        n_dd = struct.unpack_from("<I", data, opt + (108 if self.plus else 92))[0]
+        dd_off = opt + (112 if self.plus else 96)
+        self.dirs = []
+        for i in range(min(n_dd, 16)):
+            self.dirs.append(struct.unpack_from("<II", data, dd_off + i * 8))
+        sec_off = opt + self.opt_size
+        for i in range(self.nsec):
             base = sec_off + i * 40
             if base + 40 > len(data):
                 break
+            name = data[base:base + 8].rstrip(b"\x00").decode("ascii", "replace")
             vsize, va, raw_size, raw_ptr = struct.unpack_from("<IIII", data, base + 8)
-            sections.append((va, vsize, raw_ptr, raw_size))
+            flags = struct.unpack_from("<I", data, base + 36)[0]
+            self.sections.append({"name": name, "vaddr": va, "vsize": vsize,
+                                  "rawsize": raw_size, "rawptr": raw_ptr, "flags": flags})
+        self.ok = True
 
-        imports = _parse_imports(data, import_rva, sections, plus) if import_rva else {}
-        flat = sorted({f for fns in imports.values() for f in fns})
+    def rva_to_off(self, rva: int) -> int | None:
+        for s in self.sections:
+            span = max(s["vsize"], s["rawsize"])
+            if s["vaddr"] <= rva < s["vaddr"] + span:
+                return s["rawptr"] + (rva - s["vaddr"])
+        return None
+
+    def dir(self, idx: int) -> tuple[int, int]:
+        return self.dirs[idx] if idx < len(self.dirs) else (0, 0)
+
+    # ---- header summary
+
+    def header(self) -> dict:
+        data = self.data
+        chars = [v for k, v in _CHARACTERISTICS.items() if self.characteristics & k]
+        dchars = [v for k, v in _DLLCHARS.items() if self.dllchars & k]
+        is_driver = (self.subsystem == 1) or \
+            ("ntoskrnl.exe" in {d.lower() for d in self.imports()})
         return {
-            "machine": hex(machine),
-            "arch": _MACHINE.get(machine, hex(machine)),
-            "subsystem": subsystem,
-            "subsystem_name": _SUBSYSTEM.get(subsystem, str(subsystem)),
-            "native": subsystem == 1,
-            "timestamp": timestamp,
-            "imports": imports,
-            "api_count": len(flat),
-            "dangerous_imports": [f for f in flat if f.lower() in _DANGEROUS],
-            "imphash": _imphash(imports),
+            "machine": hex(self.machine),
+            "arch": _MACHINE.get(self.machine, hex(self.machine)),
+            "pointer_size": 64 if self.plus else 32,
+            "subsystem": self.subsystem,
+            "subsystem_name": _SUBSYSTEM.get(self.subsystem, str(self.subsystem)),
+            "native": self.subsystem == 1,
+            "is_driver": bool(is_driver),
+            "timestamp": self.timestamp,
+            "linker": f"{self.linker[0]}.{self.linker[1]}",
+            "image_base": hex(self.image_base),
+            "entrypoint": hex(self.entrypoint),
+            "checksum": hex(self.checksum),
+            "checksum_valid": self._checksum_ok(),
+            "characteristics": chars,
+            "dll_characteristics": dchars,
+            "nx": bool(self.dllchars & 0x0100),
+            "aslr": bool(self.dllchars & 0x0040),
+            "guard_cf": bool(self.dllchars & 0x4000),
+            "data_directories": {_DD_NAMES[i]: {"rva": hex(r), "size": s}
+                                 for i, (r, s) in enumerate(self.dirs) if r or s},
         }
-    except (struct.error, IndexError, ValueError):
+
+    def _checksum_ok(self) -> bool:
+        try:
+            data, n = self.data, len(self.data)
+            ck_off = self.opt + 64
+            s = 0
+            i = 0
+            while i + 1 < n:
+                w = 0 if ck_off <= i < ck_off + 4 else data[i] | (data[i + 1] << 8)
+                s += w
+                s = (s & 0xffff) + (s >> 16)
+                i += 2
+            if i < n:
+                s += 0 if ck_off <= i < ck_off + 4 else data[i]
+                s = (s & 0xffff) + (s >> 16)
+            s = ((s & 0xffff) + (s >> 16)) & 0xffff
+            return ((s + n) & 0xffffffff) == self.checksum
+        except Exception:
+            return False
+
+    def sections_info(self) -> list[dict]:
+        out = []
+        for s in self.sections:
+            blob = self.data[s["rawptr"]:s["rawptr"] + s["rawsize"]]
+            fl = s["flags"]
+            out.append({
+                "name": s["name"], "vaddr": hex(s["vaddr"]), "vsize": s["vsize"],
+                "rawsize": s["rawsize"], "entropy": _entropy(blob),
+                "perms": ("r" if fl & 0x40000000 else "") + ("w" if fl & 0x80000000 else "")
+                         + ("x" if fl & 0x20000000 else ""),
+                "wx": bool(fl & 0x80000000 and fl & 0x20000000),
+            })
+        return out
+
+    # ---- imports / exports
+
+    def imports(self) -> dict[str, list[str]]:
+        if hasattr(self, "_imp"):
+            return self._imp
+        imp: dict[str, list[str]] = {}
+        rva, _ = self.dir(1)
+        desc = self.rva_to_off(rva) if rva else None
+        if desc is None:
+            self._imp = imp
+            return imp
+        thunk_sz = 8 if self.plus else 4
+        ord_flag = (1 << 63) if self.plus else (1 << 31)
+        data = self.data
+        try:
+            for i in range(4096):
+                base = desc + i * 20
+                if base + 20 > len(data):
+                    break
+                oft, _ts, _fc, name_rva, ft = struct.unpack_from("<IIIII", data, base)
+                if oft == 0 and name_rva == 0 and ft == 0:
+                    break
+                noff = self.rva_to_off(name_rva)
+                dll = _cstr(data, noff).lower() if noff is not None else f"rva_{name_rva:#x}"
+                toff = self.rva_to_off(oft or ft)
+                funcs: list[str] = []
+                if toff is not None:
+                    for j in range(8192):
+                        t = toff + j * thunk_sz
+                        if t + thunk_sz > len(data):
+                            break
+                        val = struct.unpack_from("<Q" if self.plus else "<I", data, t)[0]
+                        if val == 0:
+                            break
+                        if val & ord_flag:
+                            funcs.append(f"ord{val & 0xffff}")
+                        else:
+                            hn = self.rva_to_off(val & 0x7fffffff)
+                            if hn is not None:
+                                funcs.append(_cstr(data, hn + 2, 128))
+                imp[dll] = funcs
+        except struct.error:
+            pass
+        self._imp = imp
+        return imp
+
+    def exports(self) -> list[str]:
+        rva, _ = self.dir(0)
+        off = self.rva_to_off(rva) if rva else None
+        if off is None:
+            return []
+        data = self.data
+        try:
+            n_names = struct.unpack_from("<I", data, off + 24)[0]
+            names_rva = struct.unpack_from("<I", data, off + 32)[0]
+            names_off = self.rva_to_off(names_rva)
+            if names_off is None:
+                return []
+            out = []
+            for i in range(min(n_names, 8192)):
+                nrva = struct.unpack_from("<I", data, names_off + i * 4)[0]
+                no = self.rva_to_off(nrva)
+                if no is not None:
+                    out.append(_cstr(data, no, 128))
+            return out
+        except struct.error:
+            return []
+
+    def imphash(self) -> str | None:
+        parts = []
+        for dll, funcs in self.imports().items():
+            base = dll.lower()
+            for ext in (".dll", ".ocx", ".sys"):
+                if base.endswith(ext):
+                    base = base[:-len(ext)]
+                    break
+            for fn in funcs:
+                parts.append(f"{base}.{fn.lower()}")
+        return hashlib.md5(",".join(parts).encode()).hexdigest() if parts else None
+
+    # ---- debug / pdb
+
+    def debug(self) -> dict | None:
+        rva, size = self.dir(6)
+        off = self.rva_to_off(rva) if rva else None
+        if off is None:
+            return None
+        data = self.data
+        try:
+            for i in range(size // 28):
+                base = off + i * 28
+                dtype = struct.unpack_from("<I", data, base + 12)[0]
+                sizeof = struct.unpack_from("<I", data, base + 16)[0]
+                ptr = struct.unpack_from("<I", data, base + 24)[0]
+                if dtype == 2 and data[ptr:ptr + 4] == b"RSDS":
+                    g = data[ptr + 4:ptr + 20]
+                    guid = (f"{int.from_bytes(g[0:4],'little'):08x}-"
+                            f"{int.from_bytes(g[4:6],'little'):04x}-"
+                            f"{int.from_bytes(g[6:8],'little'):04x}-"
+                            f"{g[8:10].hex()}-{g[10:16].hex()}")
+                    age = struct.unpack_from("<I", data, ptr + 20)[0]
+                    pdb = _cstr(data, ptr + 24, 260)
+                    return {"pdb": pdb, "guid": guid, "age": age}
+        except struct.error:
+            return None
+        return None
+
+    # ---- resources: version info + type map
+
+    def resources(self) -> dict:
+        rva, _ = self.dir(2)
+        root = self.rva_to_off(rva) if rva else None
+        info = {"types": [], "has_manifest": False, "has_version": False, "rcdata": 0}
+        if root is None:
+            return info
+        data = self.data
+        try:
+            n_named = struct.unpack_from("<H", data, root + 12)[0]
+            n_id = struct.unpack_from("<H", data, root + 14)[0]
+            version_blob = None
+            for e in range(n_named + n_id):
+                eoff = root + 16 + e * 8
+                rid, child = struct.unpack_from("<II", data, eoff)
+                if rid & 0x80000000:  # named type, skip id mapping
+                    continue
+                info["types"].append(rid)
+                if rid == 24:
+                    info["has_manifest"] = True
+                if rid == 10:
+                    info["rcdata"] += 1
+                if rid == 16:
+                    info["has_version"] = True
+                    version_blob = self._first_resource_data(root, child & 0x7fffffff)
+            if version_blob:
+                v = parse_version_info(version_blob)
+                if v:
+                    info["version_info"] = v
+        except struct.error:
+            pass
+        return info
+
+    def _first_resource_data(self, root: int, dir_rva_off: int) -> bytes | None:
+        """Descend a resource subtree (name -> lang) to its first data entry."""
+        data = self.data
+        off = root + dir_rva_off
+        try:
+            for _ in range(3):  # name level, lang level, then a leaf
+                n_named = struct.unpack_from("<H", data, off + 12)[0]
+                n_id = struct.unpack_from("<H", data, off + 14)[0]
+                if n_named + n_id == 0:
+                    return None
+                _rid, child = struct.unpack_from("<II", data, off + 16)  # first entry
+                if child & 0x80000000:  # another subdirectory
+                    off = root + (child & 0x7fffffff)
+                    continue
+                # leaf: IMAGE_RESOURCE_DATA_ENTRY (OffsetToData rva, Size, ...)
+                data_rva, dsize = struct.unpack_from("<II", data, root + child)
+                doff = self.rva_to_off(data_rva)
+                return data[doff:doff + dsize] if doff is not None else None
+        except struct.error:
+            return None
+        return None
+
+    # ---- authenticode
+
+    def signature(self) -> dict:
+        off, size = self.dir(4)  # NOTE: security dir offset is a FILE offset
+        if not size or off + size > len(self.data):
+            return {"embedded": False}
+        blob = self.data[off:off + size]
+        cert = blob[8:] if len(blob) > 8 else b""  # skip WIN_CERTIFICATE header
+        return {"embedded": True, "size": size, "cert_common_names": _cert_cns(cert)}
+
+
+# ------------------------------------------------------- version-info parser
+
+
+def parse_version_info(blob: bytes) -> dict | None:
+    """Best-effort VS_VERSIONINFO -> {fixed version + string table fields}."""
+    try:
+        out: dict = {}
+        # VS_FIXEDFILEINFO: locate the 0xFEEF04BD signature robustly
+        sig = blob.find((0xFEEF04BD).to_bytes(4, "little"))
+        if sig >= 0 and sig + 24 <= len(blob):
+            ms, ls = struct.unpack_from("<II", blob, sig + 8)
+            pms, pls = struct.unpack_from("<II", blob, sig + 16)
+            out["file_version"] = f"{ms >> 16}.{ms & 0xffff}.{ls >> 16}.{ls & 0xffff}"
+            out["product_version"] = f"{pms >> 16}.{pms & 0xffff}.{pls >> 16}.{pls & 0xffff}"
+        # string table entries: scan for key\0\0value\0 UTF-16 pairs under StringFileInfo
+        wanted = {"CompanyName", "ProductName", "FileDescription", "OriginalFilename",
+                  "InternalName", "FileVersion", "ProductVersion", "LegalCopyright"}
+        text = blob.decode("utf-16-le", "replace")
+        for key in wanted:
+            m = re.search(re.escape(key) + r"\x00+([^\x00]{1,200})", text)
+            if m:
+                out[key] = m.group(1).strip()
+        return out or None
+    except (struct.error, ValueError):
         return None
 
 
-def _parse_imports(data, import_rva, sections, plus) -> dict[str, list[str]]:
-    imports: dict[str, list[str]] = {}
-    desc = _rva_to_off(import_rva, sections)
-    if desc is None:
-        return imports
-    thunk_sz = 8 if plus else 4
-    ord_flag = (1 << 63) if plus else (1 << 31)
-    for i in range(4096):  # hard cap on descriptor count
-        base = desc + i * 20
-        if base + 20 > len(data):
-            break
-        oft, _ts, _fc, name_rva, ft = struct.unpack_from("<IIIII", data, base)
-        if oft == 0 and name_rva == 0 and ft == 0:
-            break
-        name_off = _rva_to_off(name_rva, sections)
-        dll = _cstr(data, name_off).lower() if name_off is not None else f"rva_{name_rva:#x}"
-        thunk_off = _rva_to_off(oft or ft, sections)
-        if thunk_off is None:
-            imports.setdefault(dll, [])
-            continue
-        funcs: list[str] = []
-        for j in range(8192):  # hard cap on symbols per DLL
-            toff = thunk_off + j * thunk_sz
-            if toff + thunk_sz > len(data):
-                break
-            val = struct.unpack_from("<Q" if plus else "<I", data, toff)[0]
-            if val == 0:
-                break
-            if val & ord_flag:
-                funcs.append(f"ord{val & 0xffff}")
-            else:
-                hn = _rva_to_off(val & 0x7fffffff, sections)
-                if hn is not None:
-                    funcs.append(_cstr(data, hn + 2))
-        imports[dll] = funcs
-    return imports
+# ------------------------------------------------------- certificate CN scan
 
 
-def _imphash(imports: dict[str, list[str]]) -> str | None:
-    """pefile-compatible imphash over the parsed import table."""
-    parts: list[str] = []
-    for dll, funcs in imports.items():
-        base = dll.lower()
-        for ext in (".dll", ".ocx", ".sys"):
-            if base.endswith(ext):
-                base = base[:-len(ext)]
-                break
-        for fn in funcs:
-            parts.append(f"{base}.{fn.lower()}")
-    if not parts:
-        return None
-    return hashlib.md5(",".join(parts).encode()).hexdigest()
+def _cert_cns(der: bytes) -> list[str]:
+    """Pull X.509 commonName attribute values out of a PKCS#7 blob (best-effort)."""
+    cns: list[str] = []
+    pat = b"\x06\x03\x55\x04\x03"  # OID 2.5.4.3 (commonName)
+    i = 0
+    while True:
+        j = der.find(pat, i)
+        if j < 0:
+            break
+        k = j + 5
+        i = k
+        if k + 2 > len(der):
+            break
+        tag = der[k]
+        ln = der[k + 1]
+        vstart = k + 2
+        if ln & 0x80:
+            nb = ln & 0x7f
+            if nb == 0 or k + 2 + nb > len(der):
+                continue
+            ln = int.from_bytes(der[k + 2:k + 2 + nb], "big")
+            vstart = k + 2 + nb
+        val = der[vstart:vstart + ln]
+        try:
+            s = val.decode("utf-16-be" if tag == 0x1e else "utf-8", "replace").strip()
+        except ValueError:
+            s = ""
+        if s and s not in cns:
+            cns.append(s)
+    return cns[:16]
 
 
 # ------------------------------------------------------------------- strings
@@ -186,15 +516,89 @@ def extract_strings(data: bytes, min_len: int = 5, max_count: int = 3000) -> dic
          for m in re.finditer(_ASCII_PAT % min_len, data)}
     u = {m.group().decode("utf-16-le", "replace")
          for m in re.finditer(_UTF16_PAT % min_len, data)}
-    u -= a  # a utf16 run also matches ascii on its low bytes; keep one bucket
+    u -= a
     asc, wide = sorted(a), sorted(u)
-    truncated = False
-    if len(asc) > max_count:
-        asc, truncated = asc[:max_count], True
-    if len(wide) > max_count:
-        wide, truncated = wide[:max_count], True
-    return {"ascii": asc, "utf16": wide,
+    truncated = len(asc) > max_count or len(wide) > max_count
+    return {"ascii": asc[:max_count], "utf16": wide[:max_count],
             "count": len(a) + len(u), "truncated": truncated}
+
+
+def interesting_strings(all_strs: list[str]) -> dict:
+    dev, reg, guids, urls, syss = set(), set(), set(), set(), set()
+    for s in all_strs:
+        low = s.lower()
+        if "\\device\\" in low or "\\??\\" in low or "\\dosdevices\\" in low \
+                or "\\driver\\" in low:
+            dev.add(s.strip())
+        if "\\registry\\" in low or "currentcontrolset" in low or low.startswith("hkey"):
+            reg.add(s.strip())
+        for g in _GUID_RE.findall(s):
+            guids.add(g.lower())
+        for u in _URL_RE.findall(s):
+            urls.add(u)
+        for sy in _SYS_RE.findall(s):
+            syss.add(sy.lower())
+    return {"device_paths": sorted(dev)[:100], "registry": sorted(reg)[:100],
+            "guids": sorted(guids)[:100], "urls": sorted(urls)[:50],
+            "other_sys": sorted(syss)[:100]}
+
+
+# ----------------------------------------------------------- HID-input signals
+
+
+def hid_input_signals(imports_flat: set[str], all_strs_low: list[str],
+                      guids: set[str]) -> dict:
+    joined = "\n".join(all_strs_low)
+    str_hits = {sig: w for sig, w in _HID_STRING_SIGNALS.items() if sig in joined}
+    imp_hits = sorted(imports_flat & _HID_IMPORT_SIGNALS)
+    guid_hits = {g: _HID_CLASS_GUIDS[g] for g in guids if g in _HID_CLASS_GUIDS}
+    creates_device = {"iocreatedevice", "iocreatedevicesecure",
+                      "wdmlibiocreatedevicesecure"} & imports_flat and \
+        "iocreatesymboliclink" in imports_flat
+    score = sum(str_hits.values()) + 2 * len(guid_hits) + len(imp_hits) + \
+        (2 if creates_device else 0)
+    strong = any(w >= 5 for w in str_hits.values())
+    if strong or score >= 8:
+        bucket = "strong"
+    elif score >= 4:
+        bucket = "candidate"
+    elif score >= 1:
+        bucket = "weak"
+    else:
+        bucket = "none"
+    return {"score": score, "bucket": bucket,
+            "string_hits": sorted(str_hits), "import_hits": imp_hits,
+            "class_guids": sorted(guid_hits.values()),
+            "creates_user_device": bool(creates_device)}
+
+
+# ------------------------------------------------------------------ loldrivers
+
+
+def _load_lol() -> dict:
+    global _LOL
+    if _LOL is None:
+        p = _REFS / "loldrivers_index.json"
+        try:
+            _LOL = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _LOL = {"drivers": {}, "by_sha256": {}, "by_imphash": {}}
+    return _LOL
+
+
+def loldrivers_match(sha256: str, imphash: str | None) -> dict:
+    lol = _load_lol()
+    did = lol["by_sha256"].get(sha256.lower())
+    match = "sha256" if did else None
+    if not did and imphash:
+        ids = lol["by_imphash"].get(imphash.lower())
+        if ids:
+            did, match = ids[0], "imphash"
+    if not did:
+        return {"known": False}
+    meta = lol["drivers"].get(did, {})
+    return {"known": True, "match": match, "id": did,
+            "category": meta.get("category"), "tags": meta.get("tags") or []}
 
 
 # ----------------------------------------------------------------- analysis
@@ -203,13 +607,67 @@ def extract_strings(data: bytes, min_len: int = 5, max_count: int = 3000) -> dic
 def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict:
     """Full byte-derived analysis line for a stored binary (sha256 = filename)."""
     data = path.read_bytes()
-    return {
+    entry: dict = {
         "sha256": path.stem,
         "kind": "analysis",
         "size": len(data),
-        "pe": pe_info(data),
-        "strings": extract_strings(data, min_str, max_str),
+        "md5": hashlib.md5(data).hexdigest(),
+        "sha1": hashlib.sha1(data).hexdigest(),
+        "entropy": _entropy(data),
     }
+    pe = PE(data)
+    imphash = None
+    imports_flat: set[str] = set()
+    if pe.ok:
+        try:
+            imports = pe.imports()
+            imports_flat = {f.lower() for fns in imports.values() for f in fns}
+            flat_sorted = sorted({f for fns in imports.values() for f in fns})
+            imphash = pe.imphash()
+            caps = {cat: sorted(imports_flat & names)
+                    for cat, names in _CAPABILITIES.items()
+                    if imports_flat & names}
+            overlay = _overlay(pe, data)
+            entry["pe"] = {
+                **pe.header(),
+                "sections": pe.sections_info(),
+                "imports": imports,
+                "import_dll_count": len(imports),
+                "api_count": len(flat_sorted),
+                "dangerous_imports": [f for f in flat_sorted if f.lower() in _DANGEROUS],
+                "capabilities": caps,
+                "exports": pe.exports()[:512],
+                "imphash": imphash,
+                "debug": pe.debug(),
+                "resources": pe.resources(),
+                "signature": pe.signature(),
+                "overlay": overlay,
+            }
+        except Exception as exc:  # never let one sub-parser sink the line
+            entry["pe"] = {"parse_error": f"{type(exc).__name__}: {exc}"}
+    else:
+        entry["pe"] = None
+
+    strings = extract_strings(data, min_str, max_str)
+    entry["strings"] = strings
+    all_strs = strings["ascii"] + strings["utf16"]
+    inter = interesting_strings(all_strs)
+    entry["interesting_strings"] = inter
+    entry["hid_input"] = hid_input_signals(
+        imports_flat, [s.lower() for s in all_strs], set(inter["guids"]))
+    entry["loldrivers"] = loldrivers_match(path.stem, imphash)
+    return entry
+
+
+def _overlay(pe: PE, data: bytes) -> dict | None:
+    try:
+        end = max((s["rawptr"] + s["rawsize"] for s in pe.sections), default=0)
+        if 0 < end < len(data):
+            blob = data[end:]
+            return {"offset": end, "size": len(blob), "entropy": _entropy(blob)}
+    except Exception:
+        return None
+    return None
 
 
 # ------------------------------------------------------------------- readers
@@ -263,10 +721,17 @@ def _analysed_shas(drivers_dir: Path) -> set[str]:
             r = json.loads(line)
         except ValueError:
             continue
-        if r.get("kind") == "analysis" or "strings" in r:
-            if r.get("sha256"):
-                done.add(r["sha256"])
+        if (r.get("kind") == "analysis" or "strings" in r) and r.get("sha256"):
+            done.add(r["sha256"])
     return done
+
+
+def _is_provenance(line: str) -> bool:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        return False
+    return r.get("kind") != "analysis" and "strings" not in r and "provenance" in r
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -277,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-str", type=int, default=3000,
                     help="max strings per bucket per driver (default 3000)")
     ap.add_argument("--rebuild", action="store_true",
-                    help="drop every existing analysis line and re-emit them "
+                    help="drop existing analysis lines and re-emit them "
                          "(provenance lines are preserved)")
     args = ap.parse_args(argv)
     drivers_dir = config.drivers_dir()
@@ -291,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
     done = _analysed_shas(drivers_dir)
     sys_files = sorted(drivers_dir.glob("*.sys"))
     added = 0
-    for i, p in enumerate(sys_files, 1):
+    for p in sys_files:
         if p.stem in done:
             continue
         try:
@@ -304,14 +769,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  analysed {added} new", file=sys.stderr)
     print(f"{ledger}: {len(sys_files)} binaries in store, {added} analysis line(s) appended")
     return 0
-
-
-def _is_provenance(line: str) -> bool:
-    try:
-        r = json.loads(line)
-    except ValueError:
-        return False
-    return r.get("kind") != "analysis" and "strings" not in r and "provenance" in r
 
 
 if __name__ == "__main__":
