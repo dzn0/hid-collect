@@ -1,0 +1,35 @@
+# hid-collect — minimal collector image.
+#
+#   docker compose build
+#   docker compose run --rm collect                       # list collectors
+#   docker compose run --rm run                           # sweep touslesdrivers-input
+#
+# Tune the sweep via environment variables (see pipeline/collectors/touslesdrivers_input.py):
+#   PDT_HID_CATEGORIES=10,11,17,19   (keyboard, mouse, tablet, gamepad)
+#   PDT_HID_TYPES=1,4                (drivers, applications)
+#   PDT_HID_MAX_BRANDS=0 / PDT_HID_MAX_PACKS=0           (0 = unlimited)
+#   PDT_HID_JOBS=6 / PDT_HID_CRAWL_JOBS=8                (parallelism)
+#   PDT_HID_MAX_MB=60                                    (per-package size cap)
+#   PDT_HID_REFRESH=1                                    (ignore resume ledger)
+#   PDT_HID_REFRESH_DISCOVERY=1                          (re-walk brand index)
+#
+# pipeline_out/ is bind-mounted so the content-addressed store, the resume
+# ledger (processed.jsonl) and the discovery cache survive rebuilds.
+
+x-hc-common: &hc-common
+  image: hid-collect:latest
+  build: .
+  volumes:
+    - ./pipeline_out:/work/pipeline_out
+    # Overlay the Python package from the host so edits don't need a rebuild.
+    - ./pipeline:/work/pipeline
+
+services:
+  collect:
+    <<: *hc-common
+    command: ["pipeline.collect", "--list"]
+
+  run:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "touslesdrivers-input"]

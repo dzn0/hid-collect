@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Collector output — all runtime state, never source.
+# Covers: content-addressed .sys store, per-run manifests, resume ledger,
+# discovery cache. A fresh clone should start clean; seed by copying from
+# another install if you want to resume.
+pipeline_out/
+
+# Legacy artifacts from the parent repo layout. Not produced by hid-collect,
+# but ignored defensively so a stray copy from hid-driver-triage never gets
+# committed by mistake.
+reports/
+vendor/

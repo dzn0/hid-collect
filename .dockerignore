@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.venv
+venv
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+README.md
+pipeline_out/drivers
+reports
