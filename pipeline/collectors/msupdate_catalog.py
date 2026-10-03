@@ -69,6 +69,11 @@ BASE = "https://www.catalog.update.microsoft.com"
 CDN_HOSTS = ("catalog.s.download.windowsupdate.com",
              "download.windowsupdate.com", "catalog.update.microsoft.com")
 
+# Width of the per-browser slot label in the live progress UI. Keep it compact
+# so the per-page detail (q 7/18 · p 12/20 · 311 rows) has room on the same
+# line even on an 80-col terminal.
+_SLOT_LABEL_WIDTH = 18
+
 # Narrow, non-overlapping queries targeting the mouse/keyboard/HID slice. One
 # page per query (25 hits max), so query diversity substitutes for pagination —
 # the catalog's ASP.NET WebForms postback is heavy and slower in aggregate than
@@ -211,34 +216,58 @@ class MsUpdateCatalogCollector(Collector):
             r["query"] = query
         return rows
 
-    def _search_paged_chunk(self, queries: list[str]) -> list[dict]:
+    def _search_paged_chunk(self, queries: list[str],
+                            rep_fn, cnt_fn, slot_fn) -> list[dict]:
         """Walk N pages per query via Playwright. One browser per chunk, serial.
 
         The catalog's ASP.NET postback (ctl00$catalogBody$nextPageLinkText) is
         blocked for urllib — it returns a generic 500 error page after one hop.
         A real browser passes through fine, so we drive Chromium headless when
         `PDT_MSC_MAX_PAGES > 1`. Fallback to urllib when Playwright is missing.
+
+        `rep_fn`/`cnt_fn`/`slot_fn` are the reporters captured on the main
+        thread; we re-register them on this worker thread so per-query /
+        per-page progress still reaches the live renderer (progress is
+        thread-local — see pipeline.progress).
         """
+        # Re-register thread-local progress reporters on this worker thread so
+        # a sub-row shows up live for each browser.
+        progress.set_reporter(rep_fn)
+        progress.set_count_reporter(cnt_fn)
+        if slot_fn is not None:
+            progress.set_slot_reporter(slot_fn)
+        slot_id = f"msc-browser-{threading.get_ident()}"
+        progress.set_slot(slot_id, "browser")
+
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
         except ImportError:
             # Playwright not installed: silently fall back to the 1-page urllib
             # path so a slim image without browsers still works.
             out = []
-            for q in queries:
+            for i, q in enumerate(queries, 1):
+                progress.set_slot(slot_id, q[:_SLOT_LABEL_WIDTH])
+                progress.report(f"q {i}/{len(queries)} (urllib fallback)")
                 out.extend(self._search(q))
+            progress.clear_slot()
             return out
         out: list[dict] = []
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                for q in queries:
-                    out.extend(self._paginate_one(browser, q))
-            finally:
-                browser.close()
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                try:
+                    for i, q in enumerate(queries, 1):
+                        progress.set_slot(slot_id, q[:_SLOT_LABEL_WIDTH])
+                        progress.report(f"q {i}/{len(queries)} starting")
+                        out.extend(self._paginate_one(browser, q, i, len(queries)))
+                finally:
+                    browser.close()
+        finally:
+            progress.clear_slot()
         return out
 
-    def _paginate_one(self, browser, query: str) -> list[dict]:
+    def _paginate_one(self, browser, query: str,
+                      q_idx: int, q_total: int) -> list[dict]:
         """Click through up to `self.max_pages` pages of one query."""
         rows: list[dict] = []
         seen_uids: set[str] = set()
@@ -263,6 +292,9 @@ class MsUpdateCatalogCollector(Collector):
                     r["page"] = page_i
                     rows.append(r)
                     new_uids.append(uid)
+                progress.report(
+                    f"q {q_idx}/{q_total} · p {page_i}/{self.max_pages} · "
+                    f"{len(rows)} rows")
                 if not new_uids:
                     break
                 if page_i == self.max_pages:
@@ -402,6 +434,10 @@ class MsUpdateCatalogCollector(Collector):
             progress.report(
                 f"searching {len(self.queries)} queries × up to {self.max_pages} "
                 f"pages via Playwright ({self.browser_workers} browsers)")
+            # Capture the main thread's reporters so each browser worker can
+            # re-register them on its own thread — per-query/per-page progress
+            # otherwise never reaches the live renderer (channel is thread-local).
+            rep_fn, cnt_fn, slot_fn = progress.current_reporters()
             # Split queries evenly across browser workers.
             k = max(1, min(self.browser_workers, len(self.queries)))
             chunks: list[list[str]] = [[] for _ in range(k)]
@@ -409,7 +445,9 @@ class MsUpdateCatalogCollector(Collector):
                 chunks[i % k].append(q)
             done = 0
             with ThreadPoolExecutor(max_workers=k) as pool:
-                futs = {pool.submit(self._search_paged_chunk, c): c for c in chunks}
+                futs = {pool.submit(self._search_paged_chunk, c,
+                                    rep_fn, cnt_fn, slot_fn): c
+                        for c in chunks}
                 for fut in as_completed(futs):
                     _ingest(fut.result())
                     done += 1
