@@ -1,19 +1,28 @@
-"""Build a single `drivers/index.json` over the content-addressed store.
+"""Parse driver binaries as bytes and feed the live `drivers/index.jsonl`.
 
-The store (`pipeline_out/drivers/<sha256>.sys`) is a flat tree of hash-named
-binaries. This module parses each one *as bytes* — no execution, no external
-deps — to extract the information a triage pass actually reads:
+The content-addressed store (`pipeline_out/drivers/<sha256>.sys`) is a flat tree
+of hash-named binaries. `index.jsonl` is the single, append-only index kept
+alongside it: as each new binary is stored, collection appends one *analysis*
+line describing it, and later one or more *provenance* lines once origin is
+known. Nothing is executed — binaries are parsed purely as bytes.
 
-  * **infos**  — PE identity: machine/arch, subsystem, timestamp, size, imphash
-  * **apis**   — every imported symbol, grouped by DLL plus a flat list, with a
-                 flagged subset of driver-abuse-relevant imports
+A line is a JSON object keyed by `sha256`. Analysis lines carry:
+
+  * **infos**  — PE identity: machine/arch, subsystem, timestamp, imphash, size,
+                 original_name, extraction_path
+  * **apis**   — every imported symbol, grouped by DLL plus a flagged
+                 driver-abuse subset
   * **strings** — deduped ASCII and UTF-16LE strings
 
-and joins the origin metadata (`original_name`, provenance, packages a binary
-shipped in) recorded during collection in `drivers/_provenance.jsonl` and in run
-`manifest.json` files. The result is written as one `drivers/index.json`.
+Provenance lines carry `{"sha256", "provenance": {...}}`. A reader folds every
+line sharing a `sha256` to get the full record (see `fold_index`).
 
-Run:  python -m pipeline.index  [--min-str N] [--max-str N] [--out PATH]
+This module also provides `analyze_binary()` (used by the collectors at store
+time) and a CLI that backfills analysis lines for any `.sys` already in the
+store that is missing one — useful after a reset or an interrupted run:
+
+    python -m pipeline.index            # append missing analysis lines
+    python -m pipeline.index --rebuild  # drop + rebuild all analysis lines
 """
 from __future__ import annotations
 import argparse
@@ -26,8 +35,6 @@ from pathlib import Path
 
 from . import config
 from .collectors import _common as C
-
-SCHEMA_VERSION = 1
 
 _MACHINE = {0x014c: "x86", 0x8664: "x64", 0xAA64: "arm64", 0x01c0: "arm", 0x01c4: "armnt"}
 _SUBSYSTEM = {0: "unknown", 1: "native", 2: "gui", 3: "console"}
@@ -46,8 +53,8 @@ _DANGEROUS = {
     "iocreatesymboliclink", "iocreatedevice", "rtlcopymemory", "memcpy",
 }
 
-_ASCII_RE = re.compile(rb"[\x20-\x7e]{%d,}")
-_UTF16_RE = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}")
+_ASCII_PAT = rb"[\x20-\x7e]{%d,}"
+_UTF16_PAT = rb"(?:[\x20-\x7e]\x00){%d,}"
 
 
 # ---------------------------------------------------------------- PE parsing
@@ -86,9 +93,9 @@ def pe_info(data: bytes) -> dict | None:
         subsystem = struct.unpack_from("<H", data, opt + 68)[0]
         dd_off = opt + (112 if plus else 96)
         n_dd = struct.unpack_from("<I", data, opt + (108 if plus else 92))[0]
-        import_rva = import_size = 0
+        import_rva = 0
         if n_dd > 1:
-            import_rva, import_size = struct.unpack_from("<II", data, dd_off + 8)
+            import_rva = struct.unpack_from("<I", data, dd_off + 8)[0]
 
         sec_off = opt + opt_size
         sections: list[tuple[int, int, int, int]] = []
@@ -99,12 +106,9 @@ def pe_info(data: bytes) -> dict | None:
             vsize, va, raw_size, raw_ptr = struct.unpack_from("<IIII", data, base + 8)
             sections.append((va, vsize, raw_ptr, raw_size))
 
-        imports: dict[str, list[str]] = {}
-        if import_rva:
-            imports = _parse_imports(data, import_rva, sections, plus)
-
+        imports = _parse_imports(data, import_rva, sections, plus) if import_rva else {}
         flat = sorted({f for fns in imports.values() for f in fns})
-        info = {
+        return {
             "machine": hex(machine),
             "arch": _MACHINE.get(machine, hex(machine)),
             "subsystem": subsystem,
@@ -116,7 +120,6 @@ def pe_info(data: bytes) -> dict | None:
             "dangerous_imports": [f for f in flat if f.lower() in _DANGEROUS],
             "imphash": _imphash(imports),
         }
-        return info
     except (struct.error, IndexError, ValueError):
         return None
 
@@ -137,8 +140,7 @@ def _parse_imports(data, import_rva, sections, plus) -> dict[str, list[str]]:
             break
         name_off = _rva_to_off(name_rva, sections)
         dll = _cstr(data, name_off).lower() if name_off is not None else f"rva_{name_rva:#x}"
-        thunk_rva = oft or ft
-        thunk_off = _rva_to_off(thunk_rva, sections)
+        thunk_off = _rva_to_off(oft or ft, sections)
         if thunk_off is None:
             imports.setdefault(dll, [])
             continue
@@ -162,8 +164,6 @@ def _parse_imports(data, import_rva, sections, plus) -> dict[str, list[str]]:
 
 def _imphash(imports: dict[str, list[str]]) -> str | None:
     """pefile-compatible imphash over the parsed import table."""
-    if not imports:
-        return None
     parts: list[str] = []
     for dll, funcs in imports.items():
         base = dll.lower()
@@ -181,14 +181,13 @@ def _imphash(imports: dict[str, list[str]]) -> str | None:
 # ------------------------------------------------------------------- strings
 
 
-def extract_strings(data: bytes, min_len: int, max_count: int) -> dict:
-    ascii_re = re.compile(_ASCII_RE.pattern % min_len)
-    utf16_re = re.compile(_UTF16_RE.pattern % min_len)
-    a = {m.group().decode("ascii", "replace") for m in ascii_re.finditer(data)}
-    u = {m.group().decode("utf-16-le", "replace") for m in utf16_re.finditer(data)}
-    u -= a  # a utf16 run also matches ascii on its low bytes; keep it in one bucket
-    asc = sorted(a)
-    wide = sorted(u)
+def extract_strings(data: bytes, min_len: int = 5, max_count: int = 3000) -> dict:
+    a = {m.group().decode("ascii", "replace")
+         for m in re.finditer(_ASCII_PAT % min_len, data)}
+    u = {m.group().decode("utf-16-le", "replace")
+         for m in re.finditer(_UTF16_PAT % min_len, data)}
+    u -= a  # a utf16 run also matches ascii on its low bytes; keep one bucket
+    asc, wide = sorted(a), sorted(u)
     truncated = False
     if len(asc) > max_count:
         asc, truncated = asc[:max_count], True
@@ -198,129 +197,121 @@ def extract_strings(data: bytes, min_len: int, max_count: int) -> dict:
             "count": len(a) + len(u), "truncated": truncated}
 
 
-# ------------------------------------------------------------- provenance join
+# ----------------------------------------------------------------- analysis
 
 
-def load_provenance(drivers_dir: Path) -> dict[str, dict]:
-    """Merge per-sha provenance from `_provenance.jsonl` and run manifests."""
-    merged: dict[str, dict] = {}
-
-    def fold(sha: str, *, original_name=None, provenance=None, extraction_path=None,
-             size=None, carved=None):
-        e = merged.setdefault(sha, {"seen_in": []})
-        if original_name and not e.get("original_name"):
-            e["original_name"] = original_name
-        if extraction_path and not e.get("extraction_path"):
-            e["extraction_path"] = extraction_path
-        if size and not e.get("size"):
-            e["size"] = size
-        if carved:
-            e["carved"] = True
-        if provenance:
-            e["provenance"] = {**(e.get("provenance") or {}), **provenance}
-            pkg = provenance.get("package_url") or provenance.get("installer_url")
-            if pkg and pkg not in e["seen_in"]:
-                e["seen_in"].append(pkg)
-
-    ledger = drivers_dir / "_provenance.jsonl"
-    if ledger.exists():
-        for line in ledger.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            sha = r.get("sha256")
-            if sha:
-                fold(sha, original_name=r.get("original_name"),
-                     provenance=r.get("provenance"), extraction_path=r.get("extraction_path"),
-                     size=r.get("size"), carved=r.get("carved"))
-
-    # Run manifests carry the richest records (original_name + full provenance).
-    for manifest in config.collectors_dir().rglob("manifest.json"):
-        try:
-            m = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        for d in m.get("drivers") or []:
-            sha = d.get("sha256")
-            if sha:
-                fold(sha, original_name=d.get("original_name"),
-                     provenance=d.get("provenance"), extraction_path=d.get("extraction_path"),
-                     size=d.get("size"), carved=d.get("carved"))
-
-    # Fallback: the touslesdrivers download ledger maps package url -> sha list.
-    for proc in config.collectors_dir().rglob("processed.jsonl"):
-        for line in proc.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            url = r.get("url")
-            for sha in r.get("sys") or []:
-                if sha in merged and not merged[sha].get("provenance") and url:
-                    fold(sha, provenance={"source_kind": "touslesdrivers-aggregator-input",
-                                          "aggregator": "touslesdrivers.com", "package_url": url})
-    return merged
-
-
-# ------------------------------------------------------------------- builder
-
-
-def build_index(*, min_str: int = 5, max_str: int = 3000) -> dict:
-    drivers_dir = config.drivers_dir()
-    prov = load_provenance(drivers_dir)
-    sys_files = sorted(drivers_dir.glob("*.sys"))
-    drivers: dict[str, dict] = {}
-    for i, p in enumerate(sys_files, 1):
-        sha = p.stem
-        try:
-            data = p.read_bytes()
-        except OSError:
-            continue
-        pe = pe_info(data)
-        strings = extract_strings(data, min_str, max_str)
-        meta = prov.get(sha, {})
-        drivers[sha] = {
-            "sha256": sha,
-            "original_name": meta.get("original_name"),
-            "size": p.stat().st_size,
-            "pe": pe,
-            "strings": strings,
-            "provenance": meta.get("provenance"),
-            "seen_in": meta.get("seen_in") or [],
-            "extraction_path": meta.get("extraction_path"),
-            "carved": meta.get("carved", False),
-        }
-        if i % 100 == 0 or i == len(sys_files):
-            print(f"  indexed {i}/{len(sys_files)}", file=sys.stderr)
+def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict:
+    """Full byte-derived analysis line for a stored binary (sha256 = filename)."""
+    data = path.read_bytes()
     return {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": C.utc_now(),
-        "driver_count": len(drivers),
-        "params": {"min_str": min_str, "max_str": max_str},
-        "drivers": drivers,
+        "sha256": path.stem,
+        "kind": "analysis",
+        "size": len(data),
+        "pe": pe_info(data),
+        "strings": extract_strings(data, min_str, max_str),
     }
 
 
+# ------------------------------------------------------------------- readers
+
+
+def fold_index(drivers_dir: Path | None = None) -> dict[str, dict]:
+    """Fold `index.jsonl` into one merged record per sha256 (analysis + provenance)."""
+    drivers_dir = drivers_dir or config.drivers_dir()
+    path = drivers_dir / "index.jsonl"
+    out: dict[str, dict] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        sha = r.get("sha256")
+        if not sha:
+            continue
+        e = out.setdefault(sha, {"sha256": sha, "seen_in": []})
+        prov = r.pop("provenance", None)
+        r.pop("ts", None)
+        for k, v in r.items():
+            if v is not None and k != "sha256":
+                e[k] = v
+        if prov:
+            e["provenance"] = {**(e.get("provenance") or {}), **prov}
+            pkg = prov.get("package_url") or prov.get("installer_url")
+            if pkg and pkg not in e["seen_in"]:
+                e["seen_in"].append(pkg)
+    return out
+
+
+# ------------------------------------------------------------------- backfill
+
+
+def _analysed_shas(drivers_dir: Path) -> set[str]:
+    path = drivers_dir / "index.jsonl"
+    done: set[str] = set()
+    if not path.exists():
+        return done
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("kind") == "analysis" or "strings" in r:
+            if r.get("sha256"):
+                done.add(r["sha256"])
+    return done
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Build drivers/index.json over the store.")
+    ap = argparse.ArgumentParser(
+        prog="pipeline.index",
+        description="Backfill analysis lines in drivers/index.jsonl for stored binaries.")
     ap.add_argument("--min-str", type=int, default=5, help="minimum string length (default 5)")
     ap.add_argument("--max-str", type=int, default=3000,
                     help="max strings per bucket per driver (default 3000)")
-    ap.add_argument("--out", type=Path, default=None,
-                    help="output path (default: pipeline_out/drivers/index.json)")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="drop every existing analysis line and re-emit them "
+                         "(provenance lines are preserved)")
     args = ap.parse_args(argv)
-    out = args.out or (config.drivers_dir() / "index.json")
-    index = build_index(min_str=args.min_str, max_str=args.max_str)
-    C.save_json(out, index)
-    print(f"wrote {out}  ({index['driver_count']} drivers)")
+    drivers_dir = config.drivers_dir()
+    ledger = drivers_dir / "index.jsonl"
+
+    if args.rebuild and ledger.exists():
+        kept = [ln for ln in ledger.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and _is_provenance(ln)]
+        ledger.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    done = _analysed_shas(drivers_dir)
+    sys_files = sorted(drivers_dir.glob("*.sys"))
+    added = 0
+    for i, p in enumerate(sys_files, 1):
+        if p.stem in done:
+            continue
+        try:
+            entry = analyze_binary(p, min_str=args.min_str, max_str=args.max_str)
+        except OSError:
+            continue
+        C.append_index(drivers_dir, entry)
+        added += 1
+        if added % 100 == 0:
+            print(f"  analysed {added} new", file=sys.stderr)
+    print(f"{ledger}: {len(sys_files)} binaries in store, {added} analysis line(s) appended")
     return 0
+
+
+def _is_provenance(line: str) -> bool:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        return False
+    return r.get("kind") != "analysis" and "strings" not in r and "provenance" in r
 
 
 if __name__ == "__main__":

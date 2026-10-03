@@ -666,11 +666,11 @@ class TousLesDriversInputCollector(Collector):
                 "package_sha256": rec["sha256"],
                 "package_size": rec["size"],
             }
-            # Log provenance now that it is attached, so the store carries origin
-            # metadata per binary even if this long, resumable run is interrupted
+            # Append provenance now that it is attached, so the store index carries
+            # origin per binary even if this long, resumable run is interrupted
             # before its manifest is written.
-            C.record_provenance(config.drivers_dir(),
-                                 {"sha256": r["sha256"], "provenance": r["provenance"]})
+            C.append_index(config.drivers_dir(),
+                           {"sha256": r["sha256"], "provenance": r["provenance"]})
         C.prune_dir(folder)
         return got, rec
 

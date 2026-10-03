@@ -354,40 +354,56 @@ def pe_identity(path: Path) -> dict | None:
 # the corpus into the parent `hid-driver-triage` repo.
 
 
-_PROVENANCE_LOCK = threading.Lock()
+_INDEX_LOCK = threading.Lock()
 
 
-def record_provenance(drivers_dir: Path, record: dict) -> None:
-    """Append one durable provenance line for a stored binary.
+def append_index(drivers_dir: Path, record: dict) -> None:
+    """Append one line to the store's live index, `drivers/index.jsonl`.
 
-    The content-addressed store (`drivers/<sha256>.sys`) is otherwise opaque, and
-    the full per-driver metadata (original name, provenance) lives only in the run
-    `manifest.json`, which is written once at the very end of a run: an interrupted
-    long run (the touslesdrivers input collector downloads thousands of packages
-    over hours) leaves the binaries on disk with no way to tell what they are or
-    where they came from. `original_name` in particular is not derivable from the
-    bytes and is lost for good.
+    The content-addressed store (`drivers/<sha256>.sys`) is otherwise opaque. This
+    index is the single artifact that makes it readable, and it updates on every
+    new `.sys`: as a binary is stored, collection appends an *analysis* line (PE
+    info, imports, strings — see `pipeline.index.analyze_binary`), and once origin
+    is known it appends *provenance* line(s). `original_name` in particular is not
+    derivable from the bytes, so capturing it here is the only way it survives an
+    interrupted run.
 
-    So, as each binary is stored, we append a line to `drivers/_provenance.jsonl`.
-    It is append-only and guarded by a lock (collectors run worker threads), which
-    keeps it cheap and interruption-safe — no read-modify-write of a growing file
-    on the hot path. The heavy, byte-derived report (PE info, imports, strings) is
-    built separately by `python -m pipeline.index`, which joins this log to produce
-    the single `drivers/index.json`. A given sha256 may appear on several lines
-    (minimal at store time, enriched with provenance afterwards, once per package it
-    ships in); the index builder merges them by sha256.
+    Append-only and guarded by a lock (collectors run worker threads): O(1) per
+    write, no read-modify-write of a growing file on the hot path, and safe to cut
+    off at any point. A given sha256 spans several lines (one analysis, plus one
+    provenance line per package it ships in); readers fold by sha256 via
+    `pipeline.index.fold_index`.
     """
     digest = record.get("sha256")
     if not digest:
         return
     row = dict(record)
-    row["ts"] = utc_now()
+    row.setdefault("ts", utc_now())
     line = json.dumps(row, ensure_ascii=False)
-    path = drivers_dir / "_provenance.jsonl"
-    with _PROVENANCE_LOCK:
+    path = drivers_dir / "index.jsonl"
+    with _INDEX_LOCK:
         drivers_dir.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+def _index_new_binary(drivers_dir: Path, target: Path, row: dict) -> None:
+    """Analyse a just-stored binary and append its index.jsonl analysis line.
+
+    Deferred import of `pipeline.index` avoids a circular import (`index` imports
+    this module). Analysis parses bytes only and must never break collection, so
+    any failure falls back to a minimal identity line.
+    """
+    try:
+        from .. import index as _index
+        entry = _index.analyze_binary(target)
+    except Exception:
+        entry = {"sha256": row.get("sha256"), "kind": "analysis", "size": row.get("size")}
+    entry["original_name"] = row.get("original_name")
+    entry["extraction_path"] = row.get("extraction_path")
+    if row.get("carved"):
+        entry["carved"] = True
+    append_index(drivers_dir, entry)
 
 
 def collect_sys_files(
@@ -440,14 +456,11 @@ def collect_sys_files(
             "stored_path": str(target),
         }
         rows.append(row)
-        # Log identity now so the binary is never anonymous, even if the run dies
-        # before its manifest is written; the collector appends provenance after
-        # acquire() returns. original_name is not recoverable from the bytes.
-        record_provenance(drivers_dir, {
-            "sha256": digest, "original_name": row["original_name"],
-            "size": row["size"], "extraction_path": row["extraction_path"],
-        })
         if is_new:
+            # New-to-corpus binary: append its analysis line to index.jsonl now,
+            # so the index updates on every new .sys and survives an interrupted
+            # run (the collector appends provenance after acquire() returns).
+            _index_new_binary(drivers_dir, target, row)
             # Count only drivers NEW to the content-addressed corpus so the live
             # total tracks corpus growth and re-downloads do not inflate it.
             progress.add_count(1)
@@ -571,11 +584,7 @@ def collect_carved_drivers(
                 "carved": True,
             }
             rows.append(row)
-            record_provenance(drivers_dir, {
-                "sha256": digest, "original_name": row["original_name"],
-                "size": row["size"], "extraction_path": row["extraction_path"],
-                "carved": True,
-            })
             if is_new:
+                _index_new_binary(drivers_dir, target, row)
                 progress.add_count(1)
     return rows

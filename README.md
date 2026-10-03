@@ -21,33 +21,38 @@ Outputs land in `pipeline_out/`:
 ```
 pipeline_out/
   drivers/<sha256>.sys                                    # the corpus
-  drivers/_provenance.jsonl                               # per-binary origin log
-  drivers/index.json                                      # built report (see below)
+  drivers/index.jsonl                                     # live index (see below)
   collectors/touslesdrivers-input/
     discovery_cache_<id>.json                             # cached brand walk
     processed.jsonl                                       # resume ledger
     <timestamp>/manifest.json                             # per-run index
 ```
 
-## Index / report
+## Index — `drivers/index.jsonl`
 
-The store is a flat tree of hash-named binaries. Build a single
-`pipeline_out/drivers/index.json` describing every one of them — PE infos
-(arch, subsystem, timestamp, imphash), imported APIs (grouped by DLL, with a
-flagged driver-abuse subset), and extracted ASCII/UTF-16 strings — joined with
-the origin metadata (`original_name`, package provenance) logged during
-collection:
+The store is a flat tree of hash-named binaries; `index.jsonl` is the single,
+append-only index kept beside it that makes it readable, and it **updates on
+every new `.sys`**. As a binary is stored, collection appends one *analysis*
+line, and once origin is known it appends *provenance* line(s). Each line is a
+JSON object keyed by `sha256`:
+
+- **analysis** — `pe` infos (arch, subsystem, timestamp, imphash), imported APIs
+  (`pe.imports` grouped by DLL + `pe.dangerous_imports`), extracted ASCII/UTF-16
+  `strings`, plus `original_name`, `size`, `extraction_path`
+- **provenance** — `{"sha256", "provenance": {...}}` (brand, package URL, …)
+
+A reader folds every line sharing a `sha256`; `pipeline.index.fold_index()` does
+this. Binaries are parsed **as bytes only** — nothing is executed. `original_name`
+is not recoverable from the bytes, so it is present only for binaries stored
+after the index existed.
+
+Appending happens automatically during collection. To (re)build analysis lines
+for binaries already in the store — e.g. after a reset or an interrupted run:
 
 ```bash
-docker compose run --rm run pipeline.index
-# or locally:  python -m pipeline.index [--min-str 5] [--max-str 3000]
+docker compose run --rm run pipeline.index           # append missing lines
+# or locally:  python -m pipeline.index [--rebuild] [--min-str 5] [--max-str 3000]
 ```
-
-Binaries are parsed **as bytes only** — nothing is executed. The report reads
-`drivers/_provenance.jsonl` (written as each binary is stored, so origin
-survives an interrupted run) and the run manifests; `original_name` is not
-recoverable from the bytes, so it is blank for binaries collected before the
-provenance log existed.
 
 Re-running resumes from both the discovery cache (brand walk reused when
 ≤ `PDT_HID_DISCOVERY_TTL_DAYS` old, default 7) and the per-URL ledger

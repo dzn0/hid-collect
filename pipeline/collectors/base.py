@@ -83,12 +83,12 @@ class Collector:
                     "installer_url": info.get("installer_url"),
                 })
             manifest["drivers"] = drivers
-            # Log provenance to the durable store ledger now that it is attached.
-            # collect_*() already logged identity at store time; this adds origin
-            # so drivers/_provenance.jsonl is complete regardless of collector.
+            # Append provenance to the store index now that it is attached.
+            # collect_*() already appended the analysis line at store time; this
+            # adds origin so drivers/index.jsonl is complete regardless of collector.
             for d in drivers:
-                C.record_provenance(config.drivers_dir(),
-                                    {"sha256": d["sha256"], "provenance": d.get("provenance")})
+                C.append_index(config.drivers_dir(),
+                               {"sha256": d["sha256"], "provenance": d.get("provenance")})
             manifest["status"] = "success" if drivers else "no_driver_extracted"
         except Exception as exc:
             manifest["status"] = "failed"
