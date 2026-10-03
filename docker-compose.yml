@@ -51,6 +51,25 @@ services:
     tty: true
     command: ["pipeline.collect", "msupdate-catalog"]
 
+  # Deep catalog crawl: paginates up to PDT_MSC_MAX_PAGES=20 per query using a
+  # headless Chromium (the catalog's ASP.NET postback blocks urllib). Needs
+  # the Playwright+Chromium image built with `WITH_PLAYWRIGHT=1`:
+  #   docker compose build --build-arg WITH_PLAYWRIGHT=1 catalog-deep
+  # Then `docker compose run --rm catalog-deep` crawls ~60 queries × 20 pages
+  # = up to ~30k UIDs instead of ~1500 — real "overnight" scope.
+  catalog-deep:
+    <<: *hc-common
+    tty: true
+    image: hid-collect:playwright
+    build:
+      context: .
+      args:
+        WITH_PLAYWRIGHT: "1"
+    environment:
+      PDT_MSC_MAX_PAGES: "20"
+      PDT_MSC_BROWSER_WORKERS: "3"
+    command: ["pipeline.collect", "msupdate-catalog"]
+
   tight:
     <<: *hc-common
     tty: true

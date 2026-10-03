@@ -38,6 +38,13 @@ Environment knobs:
 - `PDT_MSC_REFRESH=1`                               ignore download ledger
 - `PDT_MSC_REFRESH_DISCOVERY=1`                     ignore discovery cache
 - `PDT_MSC_DISCOVERY_TTL_DAYS` (int)                default: 7
+- `PDT_MSC_MAX_PAGES`       (int)                   default: 1 (urllib, no paging)
+                                                    `>1` activates Playwright
+                                                    pagination (requires `playwright`
+                                                    + `chromium` in the image)
+- `PDT_MSC_BROWSER_WORKERS` (int)                   default: 3 (parallel browsers
+                                                    for pagination; each is ~300MB
+                                                    RAM when active)
 """
 from __future__ import annotations
 import collections
@@ -179,6 +186,8 @@ class MsUpdateCatalogCollector(Collector):
         self.crawl_jobs = _env_int("PDT_MSC_CRAWL_JOBS", 12)
         self.max_packs = _env_int("PDT_MSC_MAX_PACKS", 0)
         self.max_mb = _env_int("PDT_MSC_MAX_MB", 100)
+        self.max_pages = max(1, _env_int("PDT_MSC_MAX_PAGES", 1))
+        self.browser_workers = max(1, _env_int("PDT_MSC_BROWSER_WORKERS", 3))
         self._lock = threading.Lock()
         self._ledger_lock = threading.Lock()
         self._urls: list[str] = []
@@ -202,6 +211,85 @@ class MsUpdateCatalogCollector(Collector):
             r["query"] = query
         return rows
 
+    def _search_paged_chunk(self, queries: list[str]) -> list[dict]:
+        """Walk N pages per query via Playwright. One browser per chunk, serial.
+
+        The catalog's ASP.NET postback (ctl00$catalogBody$nextPageLinkText) is
+        blocked for urllib — it returns a generic 500 error page after one hop.
+        A real browser passes through fine, so we drive Chromium headless when
+        `PDT_MSC_MAX_PAGES > 1`. Fallback to urllib when Playwright is missing.
+        """
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore
+        except ImportError:
+            # Playwright not installed: silently fall back to the 1-page urllib
+            # path so a slim image without browsers still works.
+            out = []
+            for q in queries:
+                out.extend(self._search(q))
+            return out
+        out: list[dict] = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                for q in queries:
+                    out.extend(self._paginate_one(browser, q))
+            finally:
+                browser.close()
+        return out
+
+    def _paginate_one(self, browser, query: str) -> list[dict]:
+        """Click through up to `self.max_pages` pages of one query."""
+        rows: list[dict] = []
+        seen_uids: set[str] = set()
+        page = browser.new_page(user_agent=C.UA)
+        try:
+            url = f"{BASE}/Search.aspx?q=" + urllib.parse.quote(query)
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            for page_i in range(1, self.max_pages + 1):
+                try:
+                    page.wait_for_selector('tr[id$="_R0"]', timeout=15000)
+                except Exception:
+                    # no results on this query
+                    break
+                html = page.content()
+                new_uids: list[str] = []
+                for uid, inner in RX_ROW.findall(html):
+                    if uid in seen_uids:
+                        continue
+                    seen_uids.add(uid)
+                    r = _parse_row(uid, inner)
+                    r["query"] = query
+                    r["page"] = page_i
+                    rows.append(r)
+                    new_uids.append(uid)
+                if not new_uids:
+                    break
+                if page_i == self.max_pages:
+                    break
+                nxt = page.locator('#ctl00_catalogBody_nextPageLinkText')
+                if not nxt.count():
+                    break
+                cls = nxt.get_attribute("class") or ""
+                if "disabled" in cls:
+                    break
+                # Pivot: wait for the current first row to disappear so we don't
+                # re-parse the same page before the postback finishes rendering.
+                pivot = new_uids[0]
+                try:
+                    nxt.click(timeout=5000)
+                    page.wait_for_function(
+                        f'() => !document.getElementById("{pivot}_R0")',
+                        timeout=20000)
+                except Exception:
+                    break
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+        return rows
+
     def _resolve_url(self, uid: str) -> str | None:
         payload = urllib.parse.quote(json.dumps(
             [{"size": 0, "languages": "", "uidInfo": uid, "updateID": uid}]))
@@ -222,7 +310,9 @@ class MsUpdateCatalogCollector(Collector):
         return m.group(1) if m else None
 
     def _config_fingerprint(self) -> str:
-        payload = json.dumps({"queries": sorted(self.queries)}, sort_keys=True)
+        payload = json.dumps(
+            {"queries": sorted(self.queries), "max_pages": self.max_pages},
+            sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
     def _discovery_cache_path(self) -> Path:
@@ -278,28 +368,54 @@ class MsUpdateCatalogCollector(Collector):
             progress.report(f"discovery cache hit: {len(self._urls)} pkg URLs")
             return info
 
-        # Step 1 — fan out searches, one page per query. Catalog returns up to
-        # 25 hits per query; we lean on query diversity, not postback paging.
-        progress.report(f"searching {len(self.queries)} queries")
+        # Step 1 — fan out searches. Two paths:
+        #   * max_pages == 1: urllib, one GET per query, up to crawl_jobs
+        #     workers (very fast — ~60 GETs in parallel).
+        #   * max_pages > 1 : Playwright, one browser per worker, each worker
+        #     walks a chunk of queries serially (each query clicks through up
+        #     to max_pages pages). Fewer workers (default 3) because every
+        #     browser is RAM-heavy.
         rows_by_uid: dict[str, dict] = {}
-        done = 0
-        workers = max(1, min(self.crawl_jobs, len(self.queries) or 1))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(self._search, q): q for q in self.queries}
-            for fut in as_completed(futs):
-                done += 1
-                for row in fut.result():
-                    if not _hid_shaped(row):
-                        continue
-                    # keep the first row per uid (queries overlap); accumulate
-                    # which queries matched the same update for provenance.
-                    r = rows_by_uid.setdefault(row["uid"], row)
-                    r.setdefault("queries", [])
-                    if row["query"] not in r["queries"]:
-                        r["queries"].append(row["query"])
-                progress.report(
-                    f"searches: {done}/{len(self.queries)} · "
-                    f"{len(rows_by_uid)} hid-shaped candidate(s)")
+
+        def _ingest(rows: list[dict]) -> None:
+            for row in rows:
+                if not _hid_shaped(row):
+                    continue
+                r = rows_by_uid.setdefault(row["uid"], row)
+                r.setdefault("queries", [])
+                if row["query"] not in r["queries"]:
+                    r["queries"].append(row["query"])
+
+        if self.max_pages <= 1:
+            progress.report(f"searching {len(self.queries)} queries (1 page each)")
+            workers = max(1, min(self.crawl_jobs, len(self.queries) or 1))
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(self._search, q): q for q in self.queries}
+                for fut in as_completed(futs):
+                    done += 1
+                    _ingest(fut.result())
+                    progress.report(
+                        f"searches: {done}/{len(self.queries)} · "
+                        f"{len(rows_by_uid)} hid-shaped candidate(s)")
+        else:
+            progress.report(
+                f"searching {len(self.queries)} queries × up to {self.max_pages} "
+                f"pages via Playwright ({self.browser_workers} browsers)")
+            # Split queries evenly across browser workers.
+            k = max(1, min(self.browser_workers, len(self.queries)))
+            chunks: list[list[str]] = [[] for _ in range(k)]
+            for i, q in enumerate(self.queries):
+                chunks[i % k].append(q)
+            done = 0
+            with ThreadPoolExecutor(max_workers=k) as pool:
+                futs = {pool.submit(self._search_paged_chunk, c): c for c in chunks}
+                for fut in as_completed(futs):
+                    _ingest(fut.result())
+                    done += 1
+                    progress.report(
+                        f"browser chunks: {done}/{k} · "
+                        f"{len(rows_by_uid)} hid-shaped candidate(s)")
         uids = list(rows_by_uid.keys())
 
         # Step 2 — resolve each UID's direct CDN URL in parallel.

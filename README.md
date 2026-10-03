@@ -126,14 +126,34 @@ docker compose run --rm tight     # cats 10,11 + 81-brand mouse/kbd allowlist
 | `run`   | `touslesdrivers-input` | touslesdrivers.com (aggregator) | third-party, as-shipped |
 | `tight` | `touslesdrivers-input` with `PDT_HID_CATEGORIES=10,11` + mouse/kbd allowlist | same, narrower slice | — |
 | `catalog` | `msupdate-catalog` | catalog.update.microsoft.com | WHQL-signed via Microsoft CDN |
+| `catalog-deep` | `msupdate-catalog` with Playwright pagination | same, 20 pages/query | — |
 
-The catalog collector fans ~60 narrow HID/mouse/keyboard queries (one page
-each — 25 hits per page — so query diversity substitutes for ASP.NET postback
-pagination), resolves each UID's direct `.cab` URL via `DownloadDialog.aspx`,
-and downloads in parallel. Every file is a WHQL-signed `.cab` from a Microsoft
-CDN. Env knobs mirror the TousLesDrivers collector but prefixed `PDT_MSC_`:
-`QUERIES` (`;`-separated), `JOBS`, `CRAWL_JOBS`, `MAX_PACKS`, `MAX_MB` (default
-100), `REFRESH`, `REFRESH_DISCOVERY`, `DISCOVERY_TTL_DAYS`.
+The catalog collector fans ~60 narrow HID/mouse/keyboard queries, resolves
+each UID's direct `.cab` URL via `DownloadDialog.aspx`, and downloads in
+parallel. Every file is a WHQL-signed `.cab` from a Microsoft CDN.
+
+**One-page mode (`catalog`, default).** `urllib` only, no browser. One GET
+per query (25 hits max per page — the catalog's ASP.NET postback blocks
+plain HTTP requests), so query diversity substitutes for pagination. Finishes
+in a few minutes. Image stays slim (~130MB).
+
+**Deep crawl (`catalog-deep`).** Drives a headless Chromium through up to
+`PDT_MSC_MAX_PAGES` postback pages per query (default 20 in this service),
+yielding ~500 UIDs per query instead of 25. Requires the Playwright-enabled
+image:
+
+```bash
+docker compose build --build-arg WITH_PLAYWRIGHT=1 catalog-deep
+docker compose run --rm catalog-deep           # ~60 queries × 20 pages
+```
+
+Image jumps to ~1 GB with Chromium + its apt deps; keep the regular `catalog`
+image slim and only pay the size on this one service. Env knobs:
+`PDT_MSC_QUERIES` (`;`-separated), `PDT_MSC_JOBS`, `PDT_MSC_CRAWL_JOBS`,
+`PDT_MSC_MAX_PACKS`, `PDT_MSC_MAX_MB` (default 100), `PDT_MSC_MAX_PAGES`
+(default 1 = urllib mode; `>1` activates Playwright),
+`PDT_MSC_BROWSER_WORKERS` (default 3; each ~300MB RAM when active),
+`PDT_MSC_REFRESH`, `PDT_MSC_REFRESH_DISCOVERY`, `PDT_MSC_DISCOVERY_TTL_DAYS`.
 
 All three services share the same `pipeline_out/` volume, so dedup by sha256
 happens naturally across sources — a driver that appears both in a vendor
