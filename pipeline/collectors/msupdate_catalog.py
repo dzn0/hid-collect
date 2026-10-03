@@ -74,50 +74,217 @@ CDN_HOSTS = ("catalog.s.download.windowsupdate.com",
 # line even on an 80-col terminal.
 _SLOT_LABEL_WIDTH = 18
 
-# Narrow, non-overlapping queries targeting the mouse/keyboard/HID slice. One
-# page per query (25 hits max), so query diversity substitutes for pagination —
-# the catalog's ASP.NET WebForms postback is heavy and slower in aggregate than
-# just asking a few more well-shaped questions in parallel. Picks are biased
-# toward brands where MouseClassServiceCallback-style primitives commonly ship.
-DEFAULT_QUERIES: tuple[str, ...] = (
-    # Generic class queries
-    "mouse driver",
-    "keyboard driver",
-    "HID driver",
-    "pointer driver",
-    "touchpad driver",
-    # Brand-specific — HID peripheral vendors
-    "logitech mouse", "logitech keyboard", "logitech wireless",
-    "logitech options", "logitech g hub",
-    "razer mouse", "razer keyboard", "razer synapse",
-    "razer basilisk", "razer deathadder", "razer naga",
-    "corsair mouse", "corsair keyboard", "corsair icue",
-    "steelseries mouse", "steelseries keyboard", "steelseries engine",
-    "hyperx mouse", "hyperx keyboard", "hyperx ngenuity",
-    "roccat mouse", "roccat keyboard",
-    "microsoft mouse", "microsoft keyboard", "microsoft sidewinder",
-    "microsoft arc", "microsoft surface keyboard",
-    "wooting", "ducky keyboard", "cherry keyboard",
-    "glorious mouse", "mountain keyboard", "akko keyboard",
-    "cooler master mouse", "cooler master keyboard",
-    "mad catz mouse", "mad catz keyboard",
-    "a4tech mouse", "bloody mouse",
-    "zowie mouse", "endgame gear",
-    "redragon mouse", "redragon keyboard",
-    "gaming mouse", "gaming keyboard",
-    # Touchpad vendors (laptop HID — relevant for the input-stack target)
-    "synaptics touchpad", "elan touchpad", "alps touchpad",
-    # Stylus / tablet HID
-    "wacom stylus", "surface pen",
-)
+# Default query bank. Composed programmatically so the groups are legible and
+# easy to extend. Each query is "narrow enough that the first 20 pages (500
+# hits max) stay on topic" and "broad enough that it is worth asking at all".
+# Catalog's full-text search is implicit AND on tokens, case-insensitive;
+# wildcards and boolean operators are ignored. See docstring at top.
+
+def _build_default_queries() -> tuple[str, ...]:
+    q: list[str] = []
+
+    # ─── Generic class / category — the broad net ────────────────────────────
+    q += [
+        "mouse", "keyboard", "HID", "pointer", "touchpad", "clickpad",
+        "trackpad", "trackball", "stylus", "digitizer", "pen",
+        "mouse driver", "keyboard driver", "HID driver",
+        "pointer driver", "touchpad driver", "stylus driver",
+        "gaming mouse", "gaming keyboard", "wireless mouse",
+        "wireless keyboard", "bluetooth mouse", "bluetooth keyboard",
+        "mechanical keyboard", "USB HID", "I2C HID", "precision touchpad",
+        "USB keyboard", "USB mouse", "PS/2 keyboard", "PS/2 mouse",
+        "composite HID", "HID compliant", "HID-compliant",
+    ]
+
+    # ─── Peripheral HID vendors — exhaustive ─────────────────────────────────
+    # For each brand we query both the brand alone (catches "brand driver
+    # update", "brand mouse driver" etc) and a few focused variants.
+    brands_core = [
+        "Logitech", "Logi International", "Razer", "Corsair", "SteelSeries",
+        "HyperX", "Kingston HyperX", "ROCCAT", "Turtle Entertainment",
+        "Microsoft", "Mad Catz", "Saitek", "Thrustmaster", "Trust",
+        "Wooting", "Mountain", "Glorious", "Mionix", "Zowie", "BenQ Zowie",
+        "Endgame Gear", "Pulsar", "LAMZU", "VAXEE", "Fantech", "G-Wolves",
+        "Finalmouse", "Ninjutso", "ATK", "AJAZZ", "Cooler Master", "COUGAR",
+        "Thermaltake", "Tt eSPORTS", "ASUS ROG", "ASUS", "AORUS", "GIGABYTE",
+        "MSI", "EVGA", "NZXT", "Lian Li", "ADATA XPG", "G.SKILL",
+        "Patriot Viper", "Patriot", "Alienware", "HP OMEN", "HP",
+        "Lenovo Legion", "Acer Predator", "Dell", "A4Tech", "Bloody",
+        "Redragon", "HAVIT", "Riotoro", "Tt eSPORTS", "Tesoro", "Qpad",
+        "QPAD", "DREVO", "Ducky", "DuckyChannel", "Cherry", "CHERRY MX",
+        "Akko", "Keychron", "Royal Kludge", "Monsgeek", "MonsGeek",
+        "GamaKay", "Darmoshark", "Attack Shark", "Vaxee", "Xtrfy", "Fnatic",
+        "GamaKay", "Varmilo", "KBDFans", "YUNZII", "DAREU", "Ozone",
+        "KEMOVE", "KLIM", "MelGeek", "Perixx", "Rapoo", "ELECOM",
+        "Fujitsu", "NEC", "iRocks", "Lexip", "Kensington", "Logitech G",
+        "GAMDIAS", "Dygma", "ENDORFY", "COOLKILLER", "Cool Killer",
+        "FL.Esports", "RedThunder", "Battletron", "AULA", "Easars",
+        "ProtoArc", "Fox Spirit", "Jelly Comb", "TMKB", "Xanova",
+        "G4M3R", "Rantopad", "Matrix Keyboards", "MOJO TECH",
+        "Spirit Of Gamer", "Art Lebedev", "Art. Lebedev",
+    ]
+    for b in brands_core:
+        q.append(b)
+        q.append(f"{b} mouse")
+        q.append(f"{b} keyboard")
+
+    # ─── Famous model families — one query each (narrow + diverse) ───────────
+    models = [
+        # Logitech
+        "Logitech G502", "Logitech G Pro", "Logitech G Pro X", "Logitech G903",
+        "Logitech G703", "Logitech G600", "Logitech G300", "Logitech G102",
+        "Logitech MX Master", "Logitech MX Anywhere", "Logitech MX Keys",
+        "Logitech K380", "Logitech K400", "Logitech K750", "Logitech K800",
+        "Logitech Craft", "Logitech Options", "Logitech Options+",
+        "Logitech Unifying", "Logitech LightSpeed", "Logitech G Hub",
+        "Logitech Lift", "Logitech Signature", "Logitech Pop",
+        "Logitech Pebble", "Logitech ERGO", "Logitech Harmony",
+        # Razer
+        "Razer DeathAdder", "Razer Basilisk", "Razer Viper", "Razer Naga",
+        "Razer Mamba", "Razer Lancehead", "Razer Krait", "Razer Abyssus",
+        "Razer Diamondback", "Razer Orochi", "Razer Pro Click",
+        "Razer BlackWidow", "Razer Huntsman", "Razer Cynosa",
+        "Razer Ornata", "Razer Tartarus", "Razer Pro Type",
+        "Razer Synapse", "Razer Kraken", "Razer Chroma",
+        # Corsair
+        "Corsair Katar", "Corsair Harpoon", "Corsair Ironclaw",
+        "Corsair Dark Core", "Corsair Scimitar", "Corsair Nightsword",
+        "Corsair Sabre", "Corsair M65", "Corsair M55",
+        "Corsair K70", "Corsair K95", "Corsair K63", "Corsair K55",
+        "Corsair K57", "Corsair K60", "Corsair Vengeance",
+        "Corsair Strafe", "Corsair iCUE",
+        # SteelSeries
+        "SteelSeries Aerox", "SteelSeries Prime", "SteelSeries Rival",
+        "SteelSeries Sensei", "SteelSeries Kana", "SteelSeries Apex",
+        "SteelSeries Engine", "SteelSeries GG",
+        # HyperX
+        "HyperX Pulsefire", "HyperX Alloy", "HyperX NGenuity",
+        "HyperX Haste", "HyperX Cloud",
+        # ROCCAT
+        "ROCCAT Kone", "ROCCAT Kain", "ROCCAT Burst", "ROCCAT Vulcan",
+        "ROCCAT Pyro", "ROCCAT Suora", "ROCCAT Nyth",
+        # Microsoft
+        "Microsoft IntelliMouse", "Microsoft Pro IntelliMouse",
+        "Microsoft Classic IntelliMouse", "Microsoft Precision Mouse",
+        "Microsoft Explorer Mouse", "Microsoft Sculpt",
+        "Microsoft Wedge", "Microsoft Ergonomic",
+        "Microsoft Sidewinder", "Microsoft Arc", "Microsoft Modern",
+        "Microsoft Surface Pen", "Microsoft Surface Dial",
+        "Microsoft Surface Keyboard", "Microsoft Surface Mouse",
+        "Microsoft Bluetooth Mouse", "Microsoft Bluetooth Keyboard",
+        "Microsoft Mobile Mouse", "Microsoft Comfort",
+        "Microsoft All-in-One",
+        # Mad Catz, Saitek, Thrustmaster, Fanatec
+        "Mad Catz R.A.T.", "Mad Catz Strike", "Saitek Cyborg",
+        "Saitek Eclipse", "Saitek Pro Flight",
+        # ASUS / AORUS gaming
+        "ASUS Strix", "ASUS TUF Gaming", "ASUS Armoury", "ASUS ROG Chakram",
+        "ASUS ROG Gladius", "ASUS ROG Keris", "ASUS ROG Pugio",
+        "ASUS ROG Claymore", "AORUS Thunder",
+        # Alienware / HP OMEN
+        "Alienware Mouse", "Alienware Keyboard", "HP OMEN Mouse",
+        "HP OMEN Keyboard", "Dell Alienware",
+        # Chinese boutique boards
+        "Akko MOD", "Keychron K", "Keychron Q", "Royal Kludge RK",
+        "Monsgeek M", "Darmoshark N", "Attack Shark R",
+    ]
+    q.extend(models)
+
+    # ─── Touchpad OEMs — exhaustive ──────────────────────────────────────────
+    touchpad = [
+        "Synaptics touchpad", "Synaptics clickpad", "Synaptics pointing",
+        "Synaptics SMBus", "Synaptics HID", "Synaptics Precision",
+        "ELAN touchpad", "ELAN clickpad", "ELAN pointing", "ELAN HID",
+        "ELAN I2C", "ELAN SmartPad", "Alps touchpad", "Alps pointing",
+        "Alps HID", "ALPSALPINE touchpad", "ALPS ALPINE pointing",
+        "Cypress trackpad", "Precision touchpad", "Intel precision touchpad",
+    ]
+    q.extend(touchpad)
+
+    # ─── Stylus / tablet / pen ───────────────────────────────────────────────
+    stylus = [
+        "Wacom stylus", "Wacom Bamboo", "Wacom Intuos", "Wacom Cintiq",
+        "Wacom One", "Wacom pen", "Wacom tablet", "Surface Pen",
+        "Surface Slim Pen", "Surface Dial", "XPPen stylus", "XP-Pen",
+        "Huion stylus", "Huion pen", "N-trig", "N-Trig DuoSense",
+        "stylus driver", "digitizer driver", "digitizer HID",
+    ]
+    q.extend(stylus)
+
+    # ─── Hardware IDs — major HID vendors on USB bus ─────────────────────────
+    # These queries hit the catalog's indexed hardware ID fields; many drivers
+    # ship as a USB\VID_XXXX&PID_YYYY row. Picks are the top-10 well-known
+    # vendor IDs in the HID space.
+    vids = [
+        ("046D", "Logitech"), ("1532", "Razer"), ("1B1C", "CORSAIR"),
+        ("1038", "SteelSeries"), ("0951", "HyperX / Kingston"),
+        ("1E7D", "ROCCAT"), ("045E", "Microsoft"), ("0738", "Mad Catz"),
+        ("06A3", "Saitek"), ("044F", "Thrustmaster"), ("05AC", "Apple"),
+        ("04CA", "ELAN"), ("06CB", "Synaptics"), ("044E", "Alps"),
+        ("056A", "Wacom"), ("28BD", "XP-Pen"), ("256C", "Huion"),
+        ("29EA", "Kingston Technology"), ("4653", "Fanatec"),
+        ("0C45", "Microdia / Chicony"),
+    ]
+    for hex4, _ in vids:
+        q.append(f"USB VID_{hex4}")
+        q.append(f"VID_{hex4}")
+
+    # ─── Software / overlay drivers (where MouseClassServiceCallback ships) ──
+    overlays = [
+        "G HUB", "LGHUB", "SetPoint", "Logitech Options", "Options+",
+        "Synapse", "Razer Chroma", "iCUE", "CUE", "NGenuity", "ARMOURY",
+        "ARMOURY CRATE", "Armoury Crate", "ROG Pugio", "Mystic Light",
+        "CORSAIR LINK", "LINK 6", "KeyRemap", "MousePro", "KeyPro",
+        "Dragon Center", "iGame", "AURA", "AURA Creator",
+    ]
+    q.extend(overlays)
+
+    # Dedupe while preserving order (first wins), case-insensitive.
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in q:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return tuple(out)
+
+
+DEFAULT_QUERIES: tuple[str, ...] = _build_default_queries()
 
 # Keep only results whose title or classification contains any of these — the
 # catalog returns a lot of adjacent/unrelated drivers for broad brand queries.
+# Expanded for the mass-query bank: also recognizes "input device", "composite",
+# "digitizer" + a long tail of brand/model keywords.
 HID_SHAPE_PATTERNS = re.compile(
-    r"\b(mouse|mice|keyboard|kbd|pointer|hid|touchpad|clickpad|trackpad|"
-    r"stylus|pen\s+driver|synapse|icue|g\s*hub|ngenuity|ducky|cherry|"
-    r"glorious|mountain|akko|wooting|redragon|bloody|zowie|endgame|"
-    r"basilisk|deathadder|naga|sidewinder|arc\s*mouse)\b",
+    r"\b("
+    r"mouse|mice|keyboard|kbd|pointer|hid|touchpad|clickpad|trackpad|"
+    r"trackball|stylus|digitizer|pen\s+driver|input\s+device|"
+    r"human\s+interface|composite\s+hid|"
+    # vendor / brand / model keywords — mirror the query bank
+    r"synapse|chroma|icue|cue|g\s*hub|lghub|setpoint|options\+?|"
+    r"ngenuity|armoury|armoury\s*crate|mystic\s*light|dragon\s*center|"
+    r"aura|aura\s*creator|"
+    r"ducky|cherry|glorious|mountain|akko|keychron|wooting|redragon|"
+    r"bloody|zowie|endgame|lamzu|pulsar|vaxee|fantech|finalmouse|"
+    r"ninjutso|monsgeek|darmoshark|royal\s*kludge|"
+    r"basilisk|deathadder|naga|mamba|lancehead|krait|abyssus|viper|"
+    r"intellimouse|sidewinder|arc\s*mouse|precision\s*mouse|"
+    r"ergonomic|modern\s*mobile|comfort\s*mouse|comfort\s*keyboard|"
+    r"katar|harpoon|ironclaw|scimitar|nightsword|sabre|"
+    r"aerox|prime|rival|sensei|kana|apex|"
+    r"pulsefire|alloy|haste|"
+    r"kone|kain|burst|vulcan|suora|pyro|"
+    r"r\.a\.t\.|rat\s*mouse|strike|cyborg|eclipse|pro\s*flight|"
+    r"strix|tuf\s*gaming|chakram|gladius|keris|pugio|claymore|thunder|"
+    r"alienware|omen\s*mouse|omen\s*keyboard|"
+    r"n-?trig|duosense|wacom|intuos|cintiq|bamboo|surface\s*pen|slim\s*pen|dial|"
+    r"xp-?pen|huion|"
+    r"synaptics|elan|alps(?:alpine)?|cypress|"
+    r"gaming\s*mouse|gaming\s*keyboard|mechanical\s*keyboard|"
+    r"wireless\s*(?:mouse|keyboard)|bluetooth\s*(?:mouse|keyboard)|"
+    r"usb[\\\s_]*vid[\\\s_]*[0-9a-f]{4}"
+    r")\b",
     re.I,
 )
 
