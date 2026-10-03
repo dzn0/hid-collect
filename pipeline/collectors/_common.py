@@ -354,6 +354,42 @@ def pe_identity(path: Path) -> dict | None:
 # the corpus into the parent `hid-driver-triage` repo.
 
 
+_PROVENANCE_LOCK = threading.Lock()
+
+
+def record_provenance(drivers_dir: Path, record: dict) -> None:
+    """Append one durable provenance line for a stored binary.
+
+    The content-addressed store (`drivers/<sha256>.sys`) is otherwise opaque, and
+    the full per-driver metadata (original name, provenance) lives only in the run
+    `manifest.json`, which is written once at the very end of a run: an interrupted
+    long run (the touslesdrivers input collector downloads thousands of packages
+    over hours) leaves the binaries on disk with no way to tell what they are or
+    where they came from. `original_name` in particular is not derivable from the
+    bytes and is lost for good.
+
+    So, as each binary is stored, we append a line to `drivers/_provenance.jsonl`.
+    It is append-only and guarded by a lock (collectors run worker threads), which
+    keeps it cheap and interruption-safe — no read-modify-write of a growing file
+    on the hot path. The heavy, byte-derived report (PE info, imports, strings) is
+    built separately by `python -m pipeline.index`, which joins this log to produce
+    the single `drivers/index.json`. A given sha256 may appear on several lines
+    (minimal at store time, enriched with provenance afterwards, once per package it
+    ships in); the index builder merges them by sha256.
+    """
+    digest = record.get("sha256")
+    if not digest:
+        return
+    row = dict(record)
+    row["ts"] = utc_now()
+    line = json.dumps(row, ensure_ascii=False)
+    path = drivers_dir / "_provenance.jsonl"
+    with _PROVENANCE_LOCK:
+        drivers_dir.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
 def collect_sys_files(
     extracted_root: Path,
     drivers_dir: Path,
@@ -395,13 +431,21 @@ def collect_sys_files(
         is_new = not target.exists()
         if is_new:
             shutil.copy2(p, target)
-        rows.append({
+        row = {
             "sha256": digest,
             "original_name": p.name,
             "size": p.stat().st_size,
             "pe": pe_identity(p),
             "extraction_path": str(p.relative_to(extracted_root)),
             "stored_path": str(target),
+        }
+        rows.append(row)
+        # Log identity now so the binary is never anonymous, even if the run dies
+        # before its manifest is written; the collector appends provenance after
+        # acquire() returns. original_name is not recoverable from the bytes.
+        record_provenance(drivers_dir, {
+            "sha256": digest, "original_name": row["original_name"],
+            "size": row["size"], "extraction_path": row["extraction_path"],
         })
         if is_new:
             # Count only drivers NEW to the content-addressed corpus so the live
@@ -517,13 +561,19 @@ def collect_carved_drivers(
             if is_new:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(blob)
-            rows.append({
+            row = {
                 "sha256": digest,
                 "original_name": f"{p.name}@{off}",
                 "size": len(blob),
                 "pe": pe_identity(target),
                 "extraction_path": f"{p.relative_to(extracted_root)}@{off}",
                 "stored_path": str(target),
+                "carved": True,
+            }
+            rows.append(row)
+            record_provenance(drivers_dir, {
+                "sha256": digest, "original_name": row["original_name"],
+                "size": row["size"], "extraction_path": row["extraction_path"],
                 "carved": True,
             })
             if is_new:

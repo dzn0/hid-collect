@@ -21,11 +21,33 @@ Outputs land in `pipeline_out/`:
 ```
 pipeline_out/
   drivers/<sha256>.sys                                    # the corpus
+  drivers/_provenance.jsonl                               # per-binary origin log
+  drivers/index.json                                      # built report (see below)
   collectors/touslesdrivers-input/
     discovery_cache_<id>.json                             # cached brand walk
     processed.jsonl                                       # resume ledger
     <timestamp>/manifest.json                             # per-run index
 ```
+
+## Index / report
+
+The store is a flat tree of hash-named binaries. Build a single
+`pipeline_out/drivers/index.json` describing every one of them — PE infos
+(arch, subsystem, timestamp, imphash), imported APIs (grouped by DLL, with a
+flagged driver-abuse subset), and extracted ASCII/UTF-16 strings — joined with
+the origin metadata (`original_name`, package provenance) logged during
+collection:
+
+```bash
+docker compose run --rm run pipeline.index
+# or locally:  python -m pipeline.index [--min-str 5] [--max-str 3000]
+```
+
+Binaries are parsed **as bytes only** — nothing is executed. The report reads
+`drivers/_provenance.jsonl` (written as each binary is stored, so origin
+survives an interrupted run) and the run manifests; `original_name` is not
+recoverable from the bytes, so it is blank for binaries collected before the
+provenance log existed.
 
 Re-running resumes from both the discovery cache (brand walk reused when
 ≤ `PDT_HID_DISCOVERY_TTL_DAYS` old, default 7) and the per-URL ledger
