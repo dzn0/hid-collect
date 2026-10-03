@@ -42,6 +42,15 @@ services:
   #
   # Discovery cache and processed.jsonl are shared with `run` (same volume),
   # so switching between the two does not re-walk the site or re-download.
+  # Microsoft Update Catalog — WHQL-signed HID / mouse / keyboard drivers.
+  # Fast: ~60 narrow queries (one page each, 25 hits max), parallel search +
+  # URL resolve + download. Shares the content-addressed store with every
+  # other collector, so sha256-collisions across sources auto-dedupe.
+  catalog:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "msupdate-catalog"]
+
   tight:
     <<: *hc-common
     tty: true

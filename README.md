@@ -21,7 +21,8 @@ profiles, no analyze stage. If you need triage downstream, feed
 
 ```bash
 docker compose build
-docker compose run --rm run
+docker compose run --rm run        # TousLesDrivers aggregator (default)
+docker compose run --rm catalog    # Microsoft Update Catalog (WHQL-signed)
 ```
 
 Outputs land in `pipeline_out/`:
@@ -117,6 +118,26 @@ between the two does not re-walk the site or re-download:
 docker compose run --rm tight     # cats 10,11 + 81-brand mouse/kbd allowlist
                                    # (~5100 pkgs vs run's ~5200)
 ```
+
+## Collectors
+
+| Compose service | Collector name | Source | Trust |
+|---|---|---|---|
+| `run`   | `touslesdrivers-input` | touslesdrivers.com (aggregator) | third-party, as-shipped |
+| `tight` | `touslesdrivers-input` with `PDT_HID_CATEGORIES=10,11` + mouse/kbd allowlist | same, narrower slice | — |
+| `catalog` | `msupdate-catalog` | catalog.update.microsoft.com | WHQL-signed via Microsoft CDN |
+
+The catalog collector fans ~60 narrow HID/mouse/keyboard queries (one page
+each — 25 hits per page — so query diversity substitutes for ASP.NET postback
+pagination), resolves each UID's direct `.cab` URL via `DownloadDialog.aspx`,
+and downloads in parallel. Every file is a WHQL-signed `.cab` from a Microsoft
+CDN. Env knobs mirror the TousLesDrivers collector but prefixed `PDT_MSC_`:
+`QUERIES` (`;`-separated), `JOBS`, `CRAWL_JOBS`, `MAX_PACKS`, `MAX_MB` (default
+100), `REFRESH`, `REFRESH_DISCOVERY`, `DISCOVERY_TTL_DAYS`.
+
+All three services share the same `pipeline_out/` volume, so dedup by sha256
+happens naturally across sources — a driver that appears both in a vendor
+installer and on the Microsoft catalog is stored once.
 
 ## Query — `pipeline.query`
 
