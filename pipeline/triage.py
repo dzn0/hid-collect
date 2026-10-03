@@ -103,6 +103,7 @@ def lean_record(sha: str, rec: dict) -> dict:
     if dis:
         out["injects"] = (dis.get("mouse_injection") or {}).get("verdict")
         out["symlink_user_reachable"] = dis.get("symlink_user_reachable")
+        out["requires_pnp"] = (dis.get("symlink") or {}).get("requires_pnp_enumeration")
     return {k: v for k, v in out.items() if v not in (None, [], "")}
 
 

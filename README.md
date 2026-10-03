@@ -283,6 +283,12 @@ cannot type them. WDF-registered callbacks (EvtIoDeviceControl, …) are seeded
 into the decompiled set so the IOCTL/injection logic is analysed, not just the
 `DriverEntry` callee tree.
 
+A driver that owns a PnP function device needs its devnode enumerated before the
+function exists, so its interface is not exposed by a bare `sc start`; this is
+detected from hardware-ID strings (`root\…`, `hid\…`, …) and framework PnP
+markers (`requires_pnp_enumeration` + `hardware_ids`) even when the EvtDeviceAdd
+APIs do not resolve, and it keeps the (c) verdict False for such drivers.
+
 Static reachability is strong evidence, not proof — final (c) confirmation is a
 dynamic load in an isolated VM.
 

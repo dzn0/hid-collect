@@ -71,6 +71,15 @@ _SYMLINK_APIS_WDM = ["IoCreateSymbolicLink", "IoCreateDevice",
                      "IoCreateDeviceSecure", "WdmlibIoCreateDeviceSecure"]
 _PNP_GATES = ["AddDevice", "EvtDriverDeviceAdd", "EvtDevicePrepareHardware",
               "IoAttachDeviceToDeviceStack"]
+# A driver that owns a PnP function device needs its devnode ENUMERATED before
+# the function (and often the whole driver load) happens - so its interface is
+# not exposed by a bare `sc start`. Under CFG-guarded KMDF the EvtDeviceAdd APIs
+# do not resolve by name, but two byte-visible signals do: a hardware-ID string
+# (the driver is bound to a devnode), and the framework's own debug strings.
+_HWID_PREFIXES = ("root\\", "hid\\", "pci\\", "usb\\", "acpi\\", "hdaudio\\",
+                  "swd\\", "umb\\")
+_PNP_MARKERS = ("evtdeviceadd", "evtdriverdeviceadd", "evtdeviceprepare",
+                "evtdeviced0", "prepare hardware", "add called")
 
 # WDF function-table indices (WDFFUNCENUM) for the calls that matter. These are
 # stable across recent KMDF versions (1.9-1.33) for the functions we read; if a
@@ -328,8 +337,17 @@ def main():
         # reachable from DriverEntry? walk UP (callers) from each symlink fn.
         symlink_in_entry_path = any(_reaches(f, entry) for f in sym_funcs)
 
+        # PnP function device? hardware-ID strings + framework PnP markers are
+        # byte-visible even when the EvtDeviceAdd APIs do not resolve under CFG.
+        hardware_ids = sorted(set(
+            s for s in strings if s.startswith(_HWID_PREFIXES)))
+        pnp_markers = sorted(set(
+            m for m in _PNP_MARKERS
+            if m in all_c.lower() or any(m in s for s in strings)))
+        requires_pnp = bool(hardware_ids or pnp_markers)
         pnp_gated = bool(_contains_any(all_c, _PNP_GATES)
-                         or (symbols & set(_PNP_GATES)))
+                         or (symbols & set(_PNP_GATES))
+                         or requires_pnp)
 
         # creates a symlink: WDM import, resolved WDF call, OR - the robust,
         # framework-agnostic signal that survives CFG-guarded WDF dispatch - a
@@ -368,6 +386,9 @@ def main():
             "created_by": sym_func_names[:20],
             "reachable_from_driver_entry": symlink_in_entry_path,
             "pnp_gated": pnp_gated,
+            "requires_pnp_enumeration": requires_pnp,
+            "hardware_ids": hardware_ids[:10],
+            "pnp_markers": pnp_markers[:10],
             "is_control_device": is_control_device,
             "control_inferred": control_inferred and not control_resolved,
             "sddl": sddl[:10],
@@ -481,6 +502,9 @@ def _write_report(report_dir, name_base, result, entry_c, decomp):
     lines.append("      created by               : %s" % ", ".join(sl.get("created_by") or []))
     lines.append("      reachable from DriverEntry: %s" % sl.get("reachable_from_driver_entry"))
     lines.append("      pnp gated                : %s" % sl.get("pnp_gated"))
+    lines.append("      requires pnp enumeration : %s" % sl.get("requires_pnp_enumeration"))
+    lines.append("      hardware ids             : %s" % ", ".join(sl.get("hardware_ids") or []))
+    lines.append("      pnp markers              : %s" % ", ".join(sl.get("pnp_markers") or []))
     lines.append("      is control device        : %s%s" % (
         sl.get("is_control_device"), " (inferred)" if sl.get("control_inferred") else ""))
     lines.append("      sddl [%s]              : %s" % (
