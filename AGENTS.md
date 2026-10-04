@@ -3,6 +3,108 @@
 Bootstrap + CLI reference. Pipeline: collect -> index -> triage -> disasm -> query.
 Entry points: `python -m pipeline.<stage>` (local) or `docker compose run --rm <service>`.
 
+## MISSION
+
+Find signed, production-cert, x64 Windows kernel drivers shipped with HID
+peripherals (keyboard/mouse/tablet/gamepad) that can **inject synthetic
+mouse/keyboard input from user mode, bypassing the legitimate HID stack**, via a
+**user-openable device reachable right after `sc start`** (no PnP/hardware gate).
+This is the input-spoofing / aim-assist primitive and the vulnerable-signed-driver
+(BYOVD / LOLDrivers) shape. Two verdicts decide a hit:
+- **(b) injects** — drives the mouse/kbd class callback OR feeds a virtual-HID
+  device synthetic reports over IOCTL (`mouse_injection.verdict` / lean `injects`).
+- **(c) symlink_user_reachable** — symlink created from `DriverEntry`, not behind
+  PnP, and SDDL lets a non-admin open it (`symlink_user_reachable`).
+A TARGET = (b) AND (c). **Static is evidence to NARROW + PREP, never the verdict;
+the VM is the judge of both (b) and (c)** (see DYNAMIC CONFIRM). Static (b) is a
+high-recall hint that both over- and under-calls: `virtual_hid_ioctl` fired true
+on a driver that only intercepts/remaps (vocabulary false-positive, vhidev
+`c8819dbd` - a 5-min VM sweep settled what a day of static could not). Static (c)
+likewise had a control-device-at-DriverEntry false-negative. So: use static to
+rank and to fill the probe, then LOAD IN A VM to decide.
+
+**class-hook = filter signature, NOT inject** (post-02f02ef3-ETD fix). A driver
+that handles `IOCTL_INTERNAL_MOUSE_CONNECT (0xf0203)` / `KEYBOARD_CONNECT (0xb0203)`
+and stores the class service callback is the SHAPE of a mouse/kbd class FILTER
+(ETD, Apkbfiltr, Razer rz*endpt - all VM-rejected). Those IOCTLs reach the
+driver only via `IRP_MJ_INTERNAL_DEVICE_CONTROL` from mouclass/kbdclass
+(kernel->kernel); user `CreateFile+DeviceIoControl` emits `IRP_MJ_DEVICE_CONTROL`
+and never hits them. The stored callback is fed by the hw-input path, not user.
+Walker now tags that pattern as `mouse_injection.filter_hook` (informational);
+`mouse_injection.verdict` fires only on `class_send_ioctl` or `virtual_hid_ioctl`.
+Candidate IOCTLs with `internal_only=True` (device 0xB/0xF + METHOD_NEITHER +
+FILE_ANY_ACCESS) are excluded from the probe sweep.
+
+## FAST START (do this on session open, no prompt needed)
+
+1. READ `reports/index.jsonl` (lean, one line/driver, **best-candidate-first**,
+   already folded). This is the entry point — not the big store index.
+2. CLASSIFY each row:
+   - `status=="rejected"`                                      -> **SKIP** (already ruled out; never re-pick)
+   - `status=="confirmed"`                                     -> **TARGET** (b+c proven in VM)
+   - `injects==true && symlink_user_reachable==true`           -> **TARGET CANDIDATE** (static b+c) -> CONFIRM IN VM
+   - `injects==true && !symlink_user_reachable`                -> static injects; still probe (c)-hint can be a false-negative
+   - no `injects` key present                                  -> **not yet disasm'd**
+   - CANDIDATE profile (pre-disasm, worth disasm):
+     `cert_class=="production" && arch=="x64" && declares_symlink &&
+      sddl_grants_user && hid startswith strong|candidate`
+   Rejected rows carry a `status`/`status_reason` and are sunk to the bottom of
+   `reports/index.jsonl`, so the best-first order already front-loads live work.
+   When you finish ruling a driver out, record it so the next session skips it:
+   `python -m pipeline.status reject <sha> --reason "fails (c): PnP-gated"` (see Status).
+3. CONFIRM detail: take the candidate's `sha256`, fold its lines in
+   `pipeline_out/drivers/index.jsonl` (grep the sha prefix; several lines share
+   it -> merge). Pull the WHY: `hid_input.{bucket,score,string_hits,import_hits}`,
+   `pe.device.{symlink_paths,sddl,sddl_grants_user,framework}`,
+   `pe.apis.capabilities`, `pe.signature.{cert_class,signer_cn}`, `loldrivers`.
+4. If a strong CANDIDATE has no verdict yet -> run disasm to get (b)/(c):
+   `docker compose run --rm disasm --sha <prefix>` (needs hid-collect:ghidra).
+5. REPORT directly and concisely (one block per driver), then continue the flow:
+
+```
+<sha12> <name>  [TARGET | CANDIDATE | injects-only | no-verdict]
+  signer=<signer_cn> cert=<cert_class> arch=<arch> kmdf=<t/f> framework=<fw>
+  hid=<bucket:score>  symlink=<paths>  user-open=<sddl_grants_user>
+  (b) injects=<v/?>   (c) reachable=<v/?>   lol=<y/n>
+  why: <string_hits/import_hits/capabilities that drove the score>
+  next: <disasm --sha … | dynamic VM confirm | discard: fails gate X>
+```
+
+State plainly when a set is empty (e.g. "0 TARGETs; N candidates pending disasm").
+Expect most work to be: pick candidates, disasm them, re-read, then CONFIRM the
+single best in a VM (DYNAMIC CONFIRM). Never execute a `.sys` on the pipeline
+host; the only load is `reports/<sha>/probe.ps1` in a disposable VM (see Invariants).
+
+## DYNAMIC CONFIRM (dynamic-first; the VM is the judge)
+
+Flow: `collect -> analyze -> walker -> AI picks ONE -> fill probe -> VM -> verdict`.
+The walker is the SCRIVENER (artifacts + hints), the VM is the JUDGE.
+
+1. Walker emits per driver (hints, not verdicts): `<name>.c`, `disasm.txt`,
+   `summary.md`, plus extracted `ioctls[]` (dispatch codes, decoded CTL_CODE) and
+   `report_descriptor` (per-ReportID label + payload byte sizes). These are the
+   inputs the probe needs - see summary.md sections "Candidate IOCTLs" and
+   "HID report descriptor".
+2. AI picks ONE best candidate per pass, reads its `summary.md` + `<name>.c`,
+   confirms the dispatch/symlink in `disasm.txt`.
+3. AI fills the template `pipeline/disasm/templates/dynamic_probe.ps1` -> drop the
+   filled copy at `reports/<sha256>/probe.ps1`. CONFIG fields: `LoadMode`
+   (service|pnp), `SysPath`, `ServiceName` (or `InfPath`+`HardwareId`),
+   `DeviceUser` (`\DosDevices\X` -> `\\.\X`), `ExpectSid` (WD), `Ioctls` (from the
+   walker), `Payloads` (shaped by `report_descriptor`).
+4. Run in a disposable VM / snapshotted host ONLY, elevated (UAC), with
+   `-IAmInADisposableVM`. The probe GATES before any sweep: service must be
+   RUNNING and the device object must exist, else it stops (no BSOD risk taken
+   blind). Then it proves (c) (open + SDDL) and sweeps (b) (IOCTL x payload,
+   cursor delta).
+5. Read the sweep: `dX/dY != 0` => (b) INJECTS (TARGET if (c) held); `Pend=True`
+   => blocking read (intercept/keylogger path, driver->user); `OK, Bytes=0, no
+   move` => config IOCTL. Record the verdict: `python -m pipeline.status set
+   <sha> confirmed --reason "b+c in VM: ..."` or `reject <sha> --reason "...".
+
+Dynamic does not scale (kernel load per driver, BSOD risk) - that is why step 2
+picks ONE. Static narrows + prepares; the VM confirms the top candidate.
+
 ## Layout
 
 ```
@@ -12,17 +114,24 @@ pipeline/
   triage.py               python -m pipeline.triage         (policy gate)
   sigcheck.py             PKCS#7 signer classifier (lib)
   query.py                python -m pipeline.query
+  status.py               python -m pipeline.status         (AI review status)
   config.py               tool + path resolution
   collectors/             touslesdrivers_input, msupdate_catalog
   disasm/                 python -m pipeline.disasm
     ghidra_scripts/DriverTriage.py   analyzeHeadless post-script
+    templates/dynamic_probe.ps1      VM probe template (AI fills per driver)
   refs/loldrivers_index.json
 pipeline_out/             (gitignored) machine store
   drivers/<sha256>.sys
   drivers/index.jsonl     append-only: analysis + provenance + disasm lines
 reports/                  (gitignored) consumer output
-  index.jsonl             lean index (one line/driver)
-  <sha256>/{<name>.sys,<name>-driver-entry.c,disassembly.txt}
+  index.jsonl             lean index (one line/driver; carries status when set)
+  <sha256>/<name>.sys     binary (copied from store)
+  <sha256>/<name>.c       full pseudo-C; every fn tagged [REACHED]/[UNREACHED] by walker
+  <sha256>/summary.md     (b)/(c) evidence + WDF calls + symlink callers + Candidate
+                          IOCTLs + HID report descriptor  (static = hints, not verdicts)
+  <sha256>/disasm.txt     raw objdump assembly (-d -M intel); confirmation cross-check
+  <sha256>/probe.ps1      filled dynamic_probe.ps1 (the VM step; see DYNAMIC CONFIRM)
 ```
 
 ## Build
@@ -84,6 +193,22 @@ Writes `reports/index.jsonl` (passing set) unless `--no-index`.
 `--apply` deletes failing `<sha>.sys`, drops their index lines, writes
 `pipeline_out/drivers/triage_removed_<ts>.txt`. Default = dry run.
 
+## Status (AI review verdict, persistent)
+
+```bash
+python -m pipeline.status reject <sha> --reason "fails (c): symlink not from DriverEntry"
+python -m pipeline.status clear  <sha>                 # un-reject
+python -m pipeline.status set    <sha> confirmed --reason "b+c verified in VM"
+python -m pipeline.status list                         # every driver carrying a status
+```
+
+Records an AI-authored `status` (`rejected`|`confirmed`|`candidate`|`active`) per
+driver so a ruled-out driver is not re-picked next session. Persisted as an
+append-only `kind:"status"` line in `pipeline_out/drivers/index.jsonl` (survives
+every triage/disasm rewrite; `fold_index` merges it, last-non-null wins). Surfaced
+as `status`/`status_reason` in `reports/index.jsonl`; `rejected` rows sort last.
+Each command refreshes the lean index. sha256 prefix is enough (must be unambiguous).
+
 ## Disasm (Ghidra verdicts, req b+c)
 
 ```bash
@@ -92,23 +217,37 @@ docker compose run --rm disasm --limit 200             # batch (resumable)
 docker compose run --rm disasm --sha 40061b30          # one driver by sha prefix
 docker compose run --rm disasm --gate loadable         # wider selection
 docker compose run --rm disasm --rebuild               # ignore done set
-python -m pipeline.disasm [--gate target] [--sha HEX] [--limit N] [--timeout 600] [--rebuild]
+docker compose run --rm disasm --jobs 6                # 6 parallel Ghidra workers
+docker compose run --rm disasm --shas-file reports/distinct_shas.txt --jobs 6
+python -m pipeline.disasm [--gate target] [--sha HEX] [--shas-file PATH] [--jobs N] [--limit N] [--timeout 600] [--rebuild]
 ```
 
-Requires hid-collect:ghidra. Selects via triage gate, skips sha with an existing
-disasm line (resumable). Per driver -> `reports/<sha256>/`:
-`disassembly.txt`, `<name>-driver-entry.c`, `<name>.sys`. Appends a compact
-`kind:"disasm"` line to the store index; refreshes `reports/index.jsonl`.
-Verdicts: `mouse_injection.verdict` (b), `symlink_user_reachable` (c).
+Requires hid-collect:ghidra (bundles binutils for objdump). Selects via triage
+gate (or exact list with `--shas-file`, one sha256/line, bypasses the gate),
+skips sha with an existing disasm line unless `--rebuild` (resumable). `--jobs N`
+runs N analyzeHeadless in parallel (each gets an isolated HOME; 4-6 sane on a
+12-core/16GB host). Per driver -> `reports/<sha256>/`: `<name>.c` (full pseudo-C,
+reached/unreached), `summary.md` (verdicts + evidence), `disasm.txt` (raw asm),
+`<name>.sys`. Appends a compact `kind:"disasm"` line to the store index;
+refreshes `reports/index.jsonl`.
+Static fields: `mouse_injection.verdict` (b-hint), `symlink_user_reachable`
+(c-hint), `ioctls[]` + `report_descriptor` (probe pre-fill). These RANK and PREP;
+the VM decides (b)/(c) - see DYNAMIC CONFIRM. Never reject a candidate on the
+static (b)/(c) alone (both have known false calls).
 
-Run detached (long; ~12-14h for full target set):
+`--shas-file` list: one representative per imphash group dedups the ~2187 target
+candidates to ~434 distinct binaries (duplicates are version-hashes, same code,
+same verdict). Walker blind spots = `[UNREACHED]` fns in `<name>.c` that still
+reference a symlink / connect-IOCTL / class primitive.
+
+Run detached (long; full distinct set ~434 drivers, ~1h at --jobs 6):
 ```bash
 # bash
-docker compose run --rm -T disasm > reports/disasm_run.log 2>&1 &
+docker compose run --rm -T disasm --shas-file reports/distinct_shas.txt --jobs 6 > reports/disasm_run.log 2>&1 &
 ```
 ```powershell
 # PowerShell
-Start-Job -Name disasm -ScriptBlock { Set-Location E:\hid-collect; docker compose run --rm -T disasm *>&1 | Out-File E:\hid-collect\reports\disasm_run.log -Encoding utf8 }
+Start-Job -Name disasm -ScriptBlock { Set-Location E:\hid-collect; docker compose run --rm -T disasm --shas-file reports/distinct_shas.txt --jobs 6 *>&1 | Out-File E:\hid-collect\reports\disasm_run.log -Encoding utf8 }
 Get-Content E:\hid-collect\reports\disasm_run.log -Wait -Tail 20
 ```
 
@@ -168,8 +307,13 @@ python -m pipeline.query --prod-cert --injects --symlink-reachable --fields sha,
 
 ## Invariants
 
-- static only; no `.sys` is executed. disasm = Ghidra static analysis, not a load.
-- `(c)` final confirmation = dynamic load in an isolated VM.
+- the pipeline stages (collect/index/triage/disasm/query) are static; no `.sys`
+  is executed ON THE PIPELINE HOST. disasm = Ghidra static analysis, not a load.
+- `(b)` and `(c)` final confirmation = load the emitted `reports/<sha>/probe.ps1`
+  in a disposable VM / snapshotted host (DYNAMIC CONFIRM). NEVER on the pipeline
+  host; the probe refuses without `-IAmInADisposableVM` and gates before sweeping.
 - `pipeline_out/` and `reports/` are gitignored; never commit them.
 - store index is append-only; fold by sha256 (`pipeline.index.fold_index`).
 - disasm is resumable; WDF index->name map in DriverTriage.py is version-sensitive.
+- this file's register: documentation / CLI reference — declarative, terse,
+  imperative. No conversational prose. On any rewrite, keep that register.

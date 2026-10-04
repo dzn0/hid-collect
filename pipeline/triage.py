@@ -99,22 +99,49 @@ def lean_record(sha: str, rec: dict) -> dict:
         "hid": f"{hid.get('bucket', 'none')}:{hid.get('score', 0)}",
         "loldrivers": bool((rec.get("loldrivers") or {}).get("known")) or None,
         "report": sha,
+        # AI-authored review status (e.g. "rejected"), persisted in the store index
+        # via pipeline.status and folded back in here. Empty/None is dropped below.
+        "status": rec.get("status"),
+        "status_reason": rec.get("status_reason"),
     }
     if dis:
-        out["injects"] = (dis.get("mouse_injection") or {}).get("verdict")
+        # (b) re-derived from sub-signals: class-callback-hook alone identifies a
+        # mouse/kbd class FILTER (ETD, Apkbfiltr, Razer rz*endpt - all rejected in
+        # VM), NOT a user-mode injector. Only `class_send` (sends synthetic data
+        # to the class) and `vhid_inject` (virtual-HID device + user symlink)
+        # count. Re-deriving here re-classifies drivers disasm'd before the fix
+        # without re-running Ghidra; new disasms set `verdict` the same way.
+        mi = dis.get("mouse_injection") or {}
+        sym = dis.get("symlink") or {}
+        class_send = bool(mi.get("sendclass_strings")
+                          and mi.get("indirect_call_present"))
+        vhid_inject = bool(mi.get("vhid_strings") and sym.get("creates_symlink"))
+        out["injects"] = bool(class_send or vhid_inject)
+        filter_hook = bool(
+            mi.get("class_strings")
+            and (mi.get("connect_apis") or mi.get("connect_ioctls"))
+            and mi.get("indirect_call_present"))
+        if filter_hook:                     # only emit when True (True == class filter;
+            out["filter_hook"] = True       # absent == not a filter OR not disasm'd)
         out["symlink_user_reachable"] = dis.get("symlink_user_reachable")
-        out["requires_pnp"] = (dis.get("symlink") or {}).get("requires_pnp_enumeration")
+        out["requires_pnp"] = sym.get("requires_pnp_enumeration")
     return {k: v for k, v in out.items() if v not in (None, [], "")}
 
 
 def _rank(lr: dict) -> tuple:
-    """Best candidates first: proven injection, then reachable symlink, then hid."""
+    """Best candidates first: proven injection, then reachable symlink, then hid.
+
+    Rejected rows sink to the very bottom (they stay in the index for audit, but
+    the FAST START flow skips them) so they never crowd out live candidates.
+    """
     score = 0
     try:
         score = int((lr.get("hid") or "none:0").split(":")[1])
     except (ValueError, IndexError):
         pass
-    return (bool(lr.get("injects")), bool(lr.get("symlink_user_reachable")),
+    not_rejected = lr.get("status") != "rejected"
+    return (not_rejected, bool(lr.get("injects")),
+            bool(lr.get("symlink_user_reachable")),
             bool(lr.get("sddl_grants_user")), score)
 
 

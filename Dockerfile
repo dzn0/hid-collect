@@ -65,6 +65,13 @@ RUN if [ "$WITH_GHIDRA" = "1" ]; then \
       && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# binutils (objdump): raw PE/x64 disassembly for the disasm stage's confirmation
+# cross-check (reports/<sha>/disasm.txt). Small (~a few MB) and kept in a late
+# layer so adding it never invalidates the cached JDK/Ghidra download above.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     PDT_GHIDRA_HOME=/opt/ghidra \

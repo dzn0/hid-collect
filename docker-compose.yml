@@ -72,6 +72,60 @@ services:
       PDT_MSC_BROWSER_WORKERS: "3"
     command: ["pipeline.collect", "msupdate-catalog"]
 
+  # Dell driver catalog — downloads CatalogPC.cab (~3 MB), stream-parses its
+  # XML, keeps HID-shape components (Input / Mouse / Keyboard / Touchpad /
+  # Pointing / Chipset) on Windows x64, then downloads the DUP .exe for each
+  # and extracts the .sys. Dedup is by sha256 across every collector.
+  #   docker compose run --rm dell                       # live crawl
+  #   PDT_DELL_MAX_PACKS=50 docker compose run --rm dell # small smoke test
+  #   PDT_DELL_REFRESH_DISCOVERY=1 docker compose run --rm dell  # refetch catalog
+  dell:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "dell-catalog-pc"]
+
+  # Dell enterprise driver pack catalog — 334 KB CAB pointing to ~1130 CABs
+  # (646) or EXEs (484), one per model+OS. Median ~949 MB per pack, ~1.4 TB
+  # total. Honeypot shape: each pack ships a whole model's WHQL-signed driver
+  # tree. Already x64-filtered at discovery.
+  #   docker compose run --rm dell-dp
+  #   PDT_DDP_MAX_PACKS=5 docker compose run --rm dell-dp         # smoke
+  #   PDT_DDP_MIN_DATE=2022-01 docker compose run --rm dell-dp    # newer only
+  dell-dp:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "dell-driver-pack"]
+
+  # HP enterprise driver pack catalog — single 185 KB catalog CAB pointing to
+  # ~780 self-extracting SoftPaq .exe (median ~1 GB, max ~4 GB; ~860 GB total
+  # across all packs). Each pack is a whole model's WHQL-signed driver tree
+  # (chipset, HID, net, video, …) — honeypot for driver discovery, dedup by
+  # sha256 across every other collector keeps the yield net-positive.
+  # Transient disk per worker ~= pack + its extraction; default 2 workers
+  # keep that in check.
+  #   docker compose run --rm hp
+  #   PDT_HP_MAX_PACKS=20 docker compose run --rm hp         # smoke test
+  #   PDT_HP_MIN_DATE=2022-01 docker compose run --rm hp     # newer-only
+  #   PDT_HP_MAX_MB=1500 docker compose run --rm hp          # tighter cap
+  hp:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "hp-driver-pack"]
+
+  # Microsoft WSUS offline scan catalog — ~670 MB cab enumerating every
+  # Update ever published through Windows Update. The driver subset is ~19k
+  # bundles (parent/child), yielding ~tens of thousands of unique CDN URLs
+  # on `catalog.s.download.windowsupdate.com`. Each URL is a small CAB with
+  # the WHQL `.sys` inside; median ~500 KB, long tail up to ~100 MB.
+  # First run spends ~10-15 min on the one-time catalog parse; subsequent
+  # runs hit the discovery cache.
+  #   PDT_WSUS_MAX_PACKS=200 docker compose run --rm wsus       # smoke
+  #   docker compose run --rm wsus                              # full
+  wsus:
+    <<: *hc-common
+    tty: true
+    command: ["pipeline.collect", "wsusscn2"]
+
   # Policy gate over the collected corpus. Dry run by default — prints what the
   # gates would drop (test-signed, non-x64, no device surface, …). Add --apply
   # to actually prune the store + index. See pipeline/triage.py for gates.
