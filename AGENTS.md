@@ -75,10 +75,12 @@ Expect most work to be: pick candidates, disasm them, re-read, then CONFIRM the
 single best in a VM (DYNAMIC CONFIRM). Never execute a `.sys` on the pipeline
 host; the only load is `reports/<sha>/probe.ps1` in a disposable VM (see Invariants).
 
-## DYNAMIC CONFIRM (dynamic-first; the VM is the judge)
+## DYNAMIC CONFIRM (dynamic-first; the bare-metal rig is the judge)
 
-Flow: `collect -> analyze -> walker -> AI picks ONE -> fill probe -> VM -> verdict`.
-The walker is the SCRIVENER (artifacts + hints), the VM is the JUDGE.
+Flow: `collect -> analyze -> walker -> AI picks ONE -> fill probe -> rig -> verdict`.
+The walker is the SCRIVENER (artifacts + hints), the rig is the JUDGE (bare-metal,
+HVCI-on; see DYNAMIC RIG). VM is REJECTED: VM HID/mou/kbd class structures diverge
+from bare metal and corrupt the (b) oracle (confirmed in prior work).
 
 1. Walker emits per driver (hints, not verdicts): `<name>.c`, `disasm.txt`,
    `summary.md`, plus extracted `ioctls[]` (dispatch codes, decoded CTL_CODE) and
@@ -92,18 +94,62 @@ The walker is the SCRIVENER (artifacts + hints), the VM is the JUDGE.
    (service|pnp), `SysPath`, `ServiceName` (or `InfPath`+`HardwareId`),
    `DeviceUser` (`\DosDevices\X` -> `\\.\X`), `ExpectSid` (WD), `Ioctls` (from the
    walker), `Payloads` (shaped by `report_descriptor`).
-4. Run in a disposable VM / snapshotted host ONLY, elevated (UAC), with
-   `-IAmInADisposableVM`. The probe GATES before any sweep: service must be
-   RUNNING and the device object must exist, else it stops (no BSOD risk taken
-   blind). Then it proves (c) (open + SDDL) and sweeps (b) (IOCTL x payload,
-   cursor delta).
+4. Run on the bare-metal HVCI rig (DYNAMIC RIG), elevated (UAC). The rig IS this
+   host; recovery is by OS reset (RECOVERY), not VM isolation. The probe GATES
+   before any sweep: service must be RUNNING and the device object must exist,
+   else it stops (no BSOD risk taken blind). Then it proves (c) (open + SDDL) and
+   sweeps (b) (IOCTL x payload) while the LL-hook oracle watches for any synthetic
+   mouse/kbd event.
 5. Read the sweep: `dX/dY != 0` => (b) INJECTS (TARGET if (c) held); `Pend=True`
    => blocking read (intercept/keylogger path, driver->user); `OK, Bytes=0, no
    move` => config IOCTL. Record the verdict: `python -m pipeline.status set
    <sha> confirmed --reason "b+c in VM: ..."` or `reject <sha> --reason "...".
 
 Dynamic does not scale (kernel load per driver, BSOD risk) - that is why step 2
-picks ONE. Static narrows + prepares; the VM confirms the top candidate.
+picks ONE. Static narrows + prepares; the rig confirms the top candidate.
+
+## DYNAMIC RIG + OS RECOVERY (bare-metal, HVCI-on)
+
+Judge = the bare-metal host, NOT a VM (see DYNAMIC CONFIRM for why). Non-
+virtualization hosts are out (no HVCI). This host IS the rig; this supersedes the
+old "never execute on the pipeline host" rule - recovery is by OS reset, not VM
+isolation (see RECOVERY).
+
+Rig state (REQUIRED): HVCI + VBS running, `VulnerableDriverBlocklistEnable=1`.
+Verify: `Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard
+Win32_DeviceGuard` -> `SecurityServicesRunning` contains `2` = HVCI.
+
+HVCI load-test = FREE pre-filter, folded into the `rig` step:
+- `sc start` FAILS under HVCI -> blocklisted or HVCI-incompatible -> DEAD surface,
+  discard, do NOT fuzz.
+- `sc start` LOADS -> LIVE surface (usable on a hardened modern box) -> sweep (c)/(b).
+
+Oracle = global `WH_MOUSE_LL` + `WH_KEYBOARD_LL` in an interactive session
+(session 1); ANY synthetic event during the sweep = (b) by effect. `dX/dY` alone
+misses keyboard/click injectors. A session-0 service CANNOT host the hook ->
+autologon of an admin account REQUIRED.
+
+Harness home = `E:\hidfuzz` (queue + checkpoint + `results.jsonl` + oracle);
+survives reboot AND a C: reset. Checkpoint before each `sc start` and each IOCTL;
+BSOD -> auto-reboot -> boot scheduled-task resumes at N+1; a load/IOCTL that
+bugchecks is itself signal (dangerous primitive, e.g. world-RW).
+
+Phases: (0) config - baseline, autologon, auto-reboot, boot task; (1) HVCI
+load-filter over distinct prod+x64 (live vs dead), LOW risk; (2) inject-fuzz the
+LIVE set only (IOCTL x payload + oracle), HIGH risk.
+
+## RECOVERY (OS corruption)
+
+Disk layout: `C:` (OS/kernel) = disk 1; `E:` "Dados" (store + `E:\hidfuzz`) =
+disk 0, SEPARATE; EFI/boot/recovery on disk 1. No disk image kept - workflow is
+reset-oriented (winget reinstall script + all projects on GitHub).
+- OS corruption -> Windows "Reset this PC" (Windows-drive only) + winget + `git
+  clone`. `E:` (store, 202MB `index.jsonl`, `.sys`, `memory-backup`) survives it
+  (separate disk).
+- memory files (`C:\Users\<u>\.claude\...\memory`) are wiped by a C: reset ->
+  backed up at `E:\hidfuzz\memory-backup`.
+- Residual risk: a world-RW IOCTL corrupting `E:` directly (low prob). Optional
+  insurance: gzip both `index.jsonl` OFF `E:` (USB / `gh release`).
 
 ## Layout
 
@@ -310,8 +356,10 @@ python -m pipeline.query --prod-cert --injects --symlink-reachable --fields sha,
 - the pipeline stages (collect/index/triage/disasm/query) are static; no `.sys`
   is executed ON THE PIPELINE HOST. disasm = Ghidra static analysis, not a load.
 - `(b)` and `(c)` final confirmation = load the emitted `reports/<sha>/probe.ps1`
-  in a disposable VM / snapshotted host (DYNAMIC CONFIRM). NEVER on the pipeline
-  host; the probe refuses without `-IAmInADisposableVM` and gates before sweeping.
+  on the bare-metal HVCI rig (DYNAMIC RIG). The rig IS this host; recovery is by
+  OS reset (RECOVERY), not VM isolation - VM is rejected (HID structs diverge).
+  The probe still gates before sweeping (service RUNNING + device object exists)
+  and never sweeps blind.
 - `pipeline_out/` and `reports/` are gitignored; never commit them.
 - store index is append-only; fold by sha256 (`pipeline.index.fold_index`).
 - disasm is resumable; WDF index->name map in DriverTriage.py is version-sensitive.
