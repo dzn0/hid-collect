@@ -1,28 +1,31 @@
 """Query the folded driver index from the command line.
 
-`drivers/index.jsonl` is append-only and each line is a dense, multi-kilobyte
-JSON object — not something to read by eye. This module folds it (via
-`pipeline.index.fold_index`) into one record per sha256 and lets you slice the
-corpus with composable filters, then print a table, CSV, JSON, a per-driver
-detail view, or summary stats.
+`drivers/index.jsonl` is append-only and each line is a lean, triage-focused
+JSON object — one *analysis* line per binary plus later *provenance* lines. This
+module folds it (via `pipeline.index.fold_index`) into one record per sha256 and
+lets you slice the corpus with composable filters, then print a table, CSV,
+JSON, a per-driver detail view, or summary stats.
 
-    # strong HID-injection candidates that are unsigned
-    python -m pipeline.query --hid-bucket strong --unsigned
+    # the full primitive — decompile these first
+    python -m pipeline.query --verdict match
+
+    # injects into the class stack directly and is not a virtual HID device
+    python -m pipeline.query --direct-injection --no-virtual-hid
 
     # anything importing a physical-memory primitive, as CSV
     python -m pipeline.query --capability phys_mem --csv
 
-    # drivers known to LOLDrivers, newest-corpus-first, top 20
-    python -m pipeline.query --loldrivers --sort hid_score --desc --limit 20
+    # drivers known to LOLDrivers, strongest HID signal first, top 20
+    python -m pipeline.query --loldrivers --sort rank --desc --limit 20
 
-    # everything from a brand, full JSON (feed another tool)
-    python -m pipeline.query --brand logitech --json
+    # everything matching a product, full JSON (feed another tool)
+    python -m pipeline.query --product logitech --json
 
     # one driver in detail (sha256 prefix is enough)
     python -m pipeline.query --show 1a2b3c
 
 Filters combine with AND. A repeatable filter (e.g. several --capability) matches
-a record if ANY of its values match (OR within one flag). Everything is derived
+a record if ALL of its values match (AND within one flag). Everything is derived
 from the index alone; no binary is opened here.
 """
 from __future__ import annotations
@@ -32,11 +35,22 @@ import json
 import sys
 from typing import Any, Callable, Iterable
 
+# Driver metadata carries non-Latin text (Japanese/fullwidth product names,
+# vendor strings). The Windows console defaults to cp1252 and raises
+# UnicodeEncodeError on those. Re-encode stdout/stderr as UTF-8 and never let an
+# unencodable glyph crash a listing — replace it instead.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from . import index as _index
 
 # capability bucket names, straight from the analyzer so the two never drift
 _CAP_NAMES = sorted(_index._CAPABILITIES.keys())
-_BUCKETS = ("strong", "candidate", "weak", "none")
+# the index's three-axis verdict space (see pipeline.index.hid_input_signals)
+_VERDICTS = ("match", "candidate", "virtual_hid", "none")
 
 
 # ----------------------------------------------------------------- extraction
@@ -58,43 +72,48 @@ def _pe(rec: dict) -> dict:
     return pe if isinstance(pe, dict) else {}
 
 
+def _info(rec: dict) -> dict:
+    """VS_VERSIONINFO fields the analyzer kept, keyed lower-case."""
+    info = _pe(rec).get("info")
+    return info if isinstance(info, dict) else {}
+
+
 def _caps(rec: dict) -> list[str]:
     return sorted((_pe(rec).get("capabilities") or {}).keys())
 
 
-def _version_info(rec: dict) -> dict:
-    vi = _dig(rec, "pe.resources.version_info")
-    return vi if isinstance(vi, dict) else {}
+def _hid(rec: dict) -> dict:
+    hid = rec.get("hid_input")
+    return hid if isinstance(hid, dict) else {}
+
+
+def _evidence(rec: dict) -> dict:
+    ev = _hid(rec).get("evidence")
+    return ev if isinstance(ev, dict) else {}
+
+
+def _prov(rec: dict) -> dict:
+    prov = rec.get("provenance")
+    return prov if isinstance(prov, dict) else {}
 
 
 def _display_name(rec: dict) -> str:
-    vi = _version_info(rec)
-    return (rec.get("original_name")
-            or vi.get("OriginalFilename")
-            or vi.get("InternalName")
-            or vi.get("ProductName")
-            or _dig(rec, "provenance.package_name")
+    info = _info(rec)
+    prov = _prov(rec)
+    return (info.get("originalfilename")
+            or info.get("productname")
+            or info.get("filedescription")
+            or prov.get("update_title")
+            or prov.get("package_name")
             or "-")
 
 
 def _signed(rec: dict) -> bool:
-    return bool(_dig(rec, "pe.signature.embedded"))
+    return bool(_pe(rec).get("signed"))
 
 
 def _has_wx(rec: dict) -> bool:
-    return any(s.get("wx") for s in (_pe(rec).get("sections") or []))
-
-
-def _all_strings(rec: dict) -> list[str]:
-    s = rec.get("strings") or {}
-    return list(s.get("ascii") or []) + list(s.get("utf16") or [])
-
-
-def _import_names(rec: dict) -> list[str]:
-    out: list[str] = []
-    for fns in (_pe(rec).get("imports") or {}).values():
-        out.extend(fns)
-    return out
+    return bool(_pe(rec).get("wx"))
 
 
 # Virtual columns: short names usable in --fields / --sort, resolved ahead of a
@@ -108,22 +127,28 @@ _RESOLVERS: dict[str, Callable[[dict], Any]] = {
     "entropy": lambda r: r.get("entropy") or 0.0,
     "sig": lambda r: "Y" if _signed(r) else "-",
     "signed": _signed,
-    "hid": lambda r: f"{_dig(r, 'hid_input.bucket') or 'none'}:{_dig(r, 'hid_input.score') or 0}",
-    "hid_bucket": lambda r: _dig(r, "hid_input.bucket") or "none",
-    "hid_score": lambda r: _dig(r, "hid_input.score") or 0,
+    "signer": lambda r: (_pe(r).get("signers") or ["-"])[0],
+    # the triage verdict and its rank (match=3 … none=0)
+    "hid": lambda r: f"{_hid(r).get('verdict') or 'none'}:{_hid(r).get('rank') or 0}",
+    "verdict": lambda r: _hid(r).get("verdict") or "none",
+    "rank": lambda r: _hid(r).get("rank") or 0,
+    "inj": lambda r: "Y" if _hid(r).get("direct_injection") else "-",
+    "umi": lambda r: "Y" if _hid(r).get("user_mode_interface") else "-",
+    "vhid": lambda r: "Y" if _hid(r).get("virtual_hid") else "-",
     "lol": lambda r: "Y" if _dig(r, "loldrivers.known") else "-",
     "caps": lambda r: ",".join(_caps(r)) or "-",
     "wx": lambda r: "Y" if _has_wx(r) else "-",
     "driver": lambda r: "Y" if _pe(r).get("is_driver") else "-",
-    "nx": lambda r: "Y" if _pe(r).get("nx") else "-",
-    "aslr": lambda r: "Y" if _pe(r).get("aslr") else "-",
-    "cf": lambda r: "Y" if _pe(r).get("guard_cf") else "-",
-    "brand": lambda r: _dig(r, "provenance.brand_name") or "-",
-    "company": lambda r: _version_info(r).get("CompanyName") or "-",
-    "product": lambda r: _version_info(r).get("ProductName") or "-",
-    "package": lambda r: _dig(r, "provenance.package_name") or "-",
-    "url": lambda r: _dig(r, "provenance.package_url") or "-",
+    "native": lambda r: "Y" if _pe(r).get("native") else "-",
+    "exports": lambda r: _pe(r).get("exports") or 0,
     "imphash": lambda r: _pe(r).get("imphash") or "-",
+    "pdb": lambda r: _pe(r).get("pdb") or "-",
+    "company": lambda r: _info(r).get("companyname") or "-",
+    "product": lambda r: _info(r).get("productname") or "-",
+    "package": lambda r: _prov(r).get("package_name") or "-",
+    "url": lambda r: _prov(r).get("package_url") or "-",
+    "uid": lambda r: _prov(r).get("catalog_uid") or "-",
+    "title": lambda r: _prov(r).get("update_title") or "-",
 }
 
 _DEFAULT_FIELDS = ["sha", "arch", "sig", "hid", "lol", "caps", "name"]
@@ -150,13 +175,13 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
         preds.append(lambda r: any(s in (r.get("sha256") or "").lower() for s in subs))
     if a.name:
         preds.append(lambda r: _contains_ci(
-            [_display_name(r), *( _version_info(r).get(k, "") for k in
-              ("OriginalFilename", "InternalName", "ProductName", "FileDescription"))],
+            [_display_name(r), *(_info(r).get(k, "") for k in
+             ("originalfilename", "productname", "filedescription"))],
             a.name))
-    if a.brand:
-        preds.append(lambda r: _contains_ci([_dig(r, "provenance.brand_name") or ""], a.brand))
     if a.company:
-        preds.append(lambda r: _contains_ci([_version_info(r).get("CompanyName", "")], a.company))
+        preds.append(lambda r: _contains_ci([_info(r).get("companyname", "")], a.company))
+    if a.product:
+        preds.append(lambda r: _contains_ci([_info(r).get("productname", "")], a.product))
     if a.arch:
         want = {x.lower() for x in a.arch}
         preds.append(lambda r: (_pe(r).get("arch") or "").lower() in want)
@@ -167,45 +192,52 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
             want.discard("any")
         if want:
             preds.append(lambda r: want.issubset(set(_caps(r))))
-    if a.hid_bucket:
-        want = set(a.hid_bucket)
-        preds.append(lambda r: (_dig(r, "hid_input.bucket") or "none") in want)
-    if a.min_hid_score is not None:
-        preds.append(lambda r: (_dig(r, "hid_input.score") or 0) >= a.min_hid_score)
-    if a.creates_user_device:
-        preds.append(lambda r: bool(_dig(r, "hid_input.creates_user_device")))
+
+    # ── the three triage axes ────────────────────────────────────────────────
+    if a.verdict:
+        want = set(a.verdict)
+        preds.append(lambda r: (_hid(r).get("verdict") or "none") in want)
+    if a.min_rank is not None:
+        preds.append(lambda r: (_hid(r).get("rank") or 0) >= a.min_rank)
+    if a.direct_injection:
+        preds.append(lambda r: bool(_hid(r).get("direct_injection")))
+    if a.user_mode_interface:
+        preds.append(lambda r: bool(_hid(r).get("user_mode_interface")))
+    if a.virtual_hid:
+        preds.append(lambda r: bool(_hid(r).get("virtual_hid")))
+    if a.no_virtual_hid:
+        preds.append(lambda r: not _hid(r).get("virtual_hid"))
+
     if a.signed:
         preds.append(_signed)
     if a.unsigned:
         preds.append(lambda r: not _signed(r))
+    if a.signer:
+        preds.append(lambda r: _contains_ci(_pe(r).get("signers") or [], a.signer))
     if a.loldrivers:
         preds.append(lambda r: bool(_dig(r, "loldrivers.known")))
     if a.wx:
         preds.append(_has_wx)
     if a.driver:
         preds.append(lambda r: bool(_pe(r).get("is_driver")))
-    if a.overlay:
-        preds.append(lambda r: bool(_pe(r).get("overlay")))
+    if a.native:
+        preds.append(lambda r: bool(_pe(r).get("native")))
     if a.min_entropy is not None:
         preds.append(lambda r: (r.get("entropy") or 0.0) >= a.min_entropy)
     if a.max_entropy is not None:
         preds.append(lambda r: (r.get("entropy") or 0.0) <= a.max_entropy)
-    if a.import_:
-        subs = a.import_
-        preds.append(lambda r: all(_contains_ci(_import_names(r), s) for s in subs))
-    if a.export:
-        subs = a.export
-        preds.append(lambda r: all(_contains_ci(_pe(r).get("exports") or [], s) for s in subs))
-    if a.string:
-        subs = a.string
-        preds.append(lambda r: all(_contains_ci(_all_strings(r), s) for s in subs))
-    if a.url:
-        preds.append(lambda r: _contains_ci(_dig(r, "interesting_strings.urls") or [], a.url))
-    if a.guid:
-        preds.append(lambda r: _contains_ci(_dig(r, "interesting_strings.guids") or [], a.guid))
-    if a.device_path:
-        preds.append(lambda r: _contains_ci(
-            _dig(r, "interesting_strings.device_paths") or [], a.device_path))
+    if a.imphash:
+        preds.append(lambda r: _contains_ci([_pe(r).get("imphash") or ""], a.imphash))
+    if a.pdb:
+        preds.append(lambda r: _contains_ci([_pe(r).get("pdb") or ""], a.pdb))
+
+    # ── evidence-string filters (from hid_input.evidence) ────────────────────
+    if a.symlink:
+        preds.append(lambda r: _contains_ci(_evidence(r).get("symlinks") or [], a.symlink))
+    if a.device:
+        preds.append(lambda r: _contains_ci(_evidence(r).get("device_names") or [], a.device))
+    if a.class_guid:
+        preds.append(lambda r: _contains_ci(_evidence(r).get("class_guids") or [], a.class_guid))
     return preds
 
 
@@ -213,7 +245,7 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
 
 
 _COLOR = sys.stdout.isatty()
-_C = {"strong": "\033[31m", "candidate": "\033[33m", "weak": "\033[36m",
+_C = {"match": "\033[31m", "candidate": "\033[33m", "virtual_hid": "\033[36m",
       "none": "\033[2m", "lol": "\033[31m", "reset": "\033[0m", "dim": "\033[2m"}
 
 
@@ -234,9 +266,9 @@ def _print_table(records: list[dict], fields: list[str]) -> None:
         for i, cell in enumerate(row):
             padded = cell.ljust(widths[i])
             f = fields[i]
-            if f == "hid":
-                padded = _paint(padded, (_dig(r, "hid_input.bucket") or "none"))
-            elif f in ("lol",) and cell.strip() == "Y":
+            if f in ("hid", "verdict"):
+                padded = _paint(padded, (_hid(r).get("verdict") or "none"))
+            elif f == "lol" and cell.strip() == "Y":
                 padded = _paint(padded, "lol")
             cells.append(padded)
         print("  ".join(cells))
@@ -249,29 +281,16 @@ def _print_csv(records: list[dict], fields: list[str]) -> None:
         w.writerow([_field(r, f) for f in fields])
 
 
-def _slim_for_json(rec: dict, with_strings: bool) -> dict:
-    """Drop the heavy raw-strings blob from JSON unless explicitly requested."""
-    if with_strings:
-        return rec
-    out = dict(rec)
-    s = out.get("strings")
-    if isinstance(s, dict):
-        out["strings"] = {"count": s.get("count"), "truncated": s.get("truncated"),
-                          "_omitted": "pass --strings to include ascii/utf16"}
-    return out
-
-
 # ------------------------------------------------------------------- detail
 
 
-def _print_detail(rec: dict, with_strings: bool) -> None:
+def _print_detail(rec: dict) -> None:
     pe = _pe(rec)
-    vi = _version_info(rec)
-    sig = pe.get("signature") or {}
-    hid = rec.get("hid_input") or {}
+    info = _info(rec)
+    hid = _hid(rec)
+    ev = _evidence(rec)
     lol = rec.get("loldrivers") or {}
-    prov = rec.get("provenance") or {}
-    inter = rec.get("interesting_strings") or {}
+    prov = _prov(rec)
 
     def head(t): print(_paint(f"\n== {t} ==", "dim"))
 
@@ -279,32 +298,22 @@ def _print_detail(rec: dict, with_strings: bool) -> None:
     print(f"name        {_display_name(rec)}")
     print(f"size        {rec.get('size')} bytes   entropy {rec.get('entropy')}")
     print(f"md5         {rec.get('md5')}")
-    print(f"sha1        {rec.get('sha1')}")
 
     head("pe")
-    if pe:
-        print(f"arch        {pe.get('arch')}  subsystem {pe.get('subsystem_name')}  "
-              f"is_driver {pe.get('is_driver')}")
-        print(f"linker      {pe.get('linker')}  imphash {pe.get('imphash')}")
-        print(f"mitigations nx={pe.get('nx')} aslr={pe.get('aslr')} guard_cf={pe.get('guard_cf')}  "
-              f"checksum_valid={pe.get('checksum_valid')}")
-        wx = [s["name"] for s in (pe.get("sections") or []) if s.get("wx")]
-        if wx:
-            print(f"W^X broken  sections: {', '.join(wx)}")
-        if pe.get("overlay"):
-            ov = pe["overlay"]
-            print(f"overlay     offset={ov.get('offset')} size={ov.get('size')} "
-                  f"entropy={ov.get('entropy')}")
+    if pe and not pe.get("parse_error"):
+        print(f"arch        {pe.get('arch')}  is_driver {pe.get('is_driver')}  "
+              f"native {pe.get('native')}")
+        print(f"imphash     {pe.get('imphash')}")
+        print(f"exports     {pe.get('exports')}   W^X {pe.get('wx')}")
+        if pe.get("pdb"):
+            print(f"pdb         {pe.get('pdb')}")
+        print(f"signed      {pe.get('signed')}")
+        for cn in (pe.get("signers") or []):
+            print(f"  signer    {cn}")
+    elif pe.get("parse_error"):
+        print(f"(parse error: {pe.get('parse_error')})")
     else:
         print("(not a PE / unparsed)")
-
-    head("signature")
-    if sig.get("embedded"):
-        print(f"embedded    yes ({sig.get('size')} bytes)")
-        for cn in (sig.get("cert_common_names") or []):
-            print(f"  cert      {cn}")
-    else:
-        print("embedded    no")
 
     head("capabilities")
     caps = pe.get("capabilities") or {}
@@ -313,16 +322,27 @@ def _print_detail(rec: dict, with_strings: bool) -> None:
             print(f"  {cat:<16} {', '.join(fns)}")
     else:
         print("  (none of the tracked buckets)")
-    dang = pe.get("dangerous_imports") or []
-    if dang:
-        print(f"dangerous   {', '.join(dang)}")
 
     head("hid_input")
-    print(f"bucket      {hid.get('bucket')}  score {hid.get('score')}  "
-          f"creates_user_device {hid.get('creates_user_device')}")
-    for k in ("string_hits", "import_hits", "class_guids"):
-        if hid.get(k):
-            print(f"  {k:<12} {', '.join(hid[k])}")
+    print(f"verdict     {_paint(hid.get('verdict') or 'none', hid.get('verdict') or 'none')}"
+          f"  rank {hid.get('rank')}")
+    print(f"axes        direct_injection={hid.get('direct_injection')}  "
+          f"user_mode_interface={hid.get('user_mode_interface')}  "
+          f"virtual_hid={hid.get('virtual_hid')}")
+    if ev:
+        _ev_list("injection imports", ev.get("injection_imports"))
+        _ev_list("injection strings", ev.get("injection_strings"))
+        if ev.get("class_stack_attach"):
+            print("  class_stack_attach  yes (IoGetDeviceObjectPointer + attach)")
+        _ev_list("class device targets", ev.get("class_device_targets"))
+        if ev.get("creates_user_device"):
+            print("  creates_user_device yes (IoCreateDevice + IoCreateSymbolicLink)")
+        _ev_list("symlinks", ev.get("symlinks"))
+        _ev_list("device names", ev.get("device_names"))
+        _ev_list("vhf imports", ev.get("vhf_imports"))
+        if ev.get("hid_minidriver"):
+            print("  hid_minidriver      yes (HidRegisterMinidriver / hidclass)")
+        _ev_list("class guids", ev.get("class_guids"))
 
     head("loldrivers")
     if lol.get("known"):
@@ -333,32 +353,32 @@ def _print_detail(rec: dict, with_strings: bool) -> None:
     else:
         print("known       no")
 
-    if vi:
+    if info:
         head("version_info")
-        for k in ("CompanyName", "ProductName", "FileDescription", "OriginalFilename",
-                  "FileVersion", "ProductVersion", "LegalCopyright"):
-            if vi.get(k):
-                print(f"  {k:<18} {vi[k]}")
+        for k in ("companyname", "productname", "filedescription",
+                  "originalfilename", "fileversion"):
+            if info.get(k):
+                print(f"  {k:<18} {info[k]}")
 
     head("provenance")
-    for k in ("brand_name", "package_name", "package_url", "aggregator", "package_sha256"):
+    for k in ("source_kind", "aggregator", "update_title", "update_product",
+              "update_classification", "update_date", "update_version",
+              "catalog_uid", "package_name", "package_url", "package_sha256"):
         if prov.get(k):
-            print(f"  {k:<16} {prov[k]}")
+            print(f"  {k:<22} {prov[k]}")
+    if prov.get("matched_queries"):
+        print(f"  matched_queries        {', '.join(prov['matched_queries'])}")
     if rec.get("seen_in"):
-        print(f"  seen_in         {len(rec['seen_in'])} package(s)")
+        print(f"  seen_in                {len(rec['seen_in'])} package(s)")
 
-    head("interesting strings")
-    for k in ("device_paths", "registry", "guids", "urls", "other_sys"):
-        vals = inter.get(k) or []
-        if vals:
-            shown = ", ".join(vals[:12])
-            more = f"  (+{len(vals) - 12} more)" if len(vals) > 12 else ""
-            print(f"  {k:<14} {shown}{more}")
 
-    if with_strings:
-        head("strings (raw)")
-        for s in _all_strings(rec):
-            print(f"  {s}")
+def _ev_list(label: str, vals: list | None) -> None:
+    vals = vals or []
+    if not vals:
+        return
+    shown = ", ".join(vals[:12])
+    more = f"  (+{len(vals) - 12} more)" if len(vals) > 12 else ""
+    print(f"  {label:<20}{shown}{more}")
 
 
 # -------------------------------------------------------------------- stats
@@ -381,15 +401,19 @@ def _print_stats(records: list[dict]) -> None:
         parts = ", ".join(f"{k}={v}" for k, v in counter.most_common())
         print(f"{label:<18} {parts}")
 
-    _dist("hid buckets", Counter((_dig(r, "hid_input.bucket") or "none") for r in records))
+    _dist("verdicts", Counter((_hid(r).get("verdict") or "none") for r in records))
+    _dist("axes true", Counter(
+        axis for r in records for axis in
+        ("direct_injection", "user_mode_interface", "virtual_hid")
+        if _hid(r).get(axis)))
     _dist("arch", Counter((_pe(r).get("arch") or "-") for r in records))
     cap_counter: Counter = Counter()
     for r in records:
         cap_counter.update(_caps(r))
     if cap_counter:
         _dist("capabilities", cap_counter)
-    _dist("top brands", Counter((_dig(r, "provenance.brand_name") or "-")
-                                for r in records))
+    _dist("top products", Counter((_info(r).get("productname") or "-")
+                                  for r in records))
 
 
 # --------------------------------------------------------------------- main
@@ -415,42 +439,51 @@ def main(argv: list[str] | None = None) -> int:
         prog="pipeline.query",
         description="Filter and inspect the folded driver index (drivers/index.jsonl).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Filters AND together; a repeated flag ORs its own values.")
+        epilog="Filters AND together; a repeated flag ANDs its own values.")
 
     # filters
     f = ap.add_argument_group("filters")
     f.add_argument("--sha", action="append", metavar="HEX", help="sha256 substring (repeatable)")
     f.add_argument("--name", metavar="SUBSTR", help="match name / version-info (ci)")
-    f.add_argument("--brand", metavar="SUBSTR", help="provenance brand name (ci)")
     f.add_argument("--company", metavar="SUBSTR", help="version-info CompanyName (ci)")
-    f.add_argument("--arch", action="append", choices=None, metavar="ARCH",
+    f.add_argument("--product", metavar="SUBSTR", help="version-info ProductName (ci)")
+    f.add_argument("--arch", action="append", metavar="ARCH",
                    help="x64/x86/arm64/… (repeatable)")
     f.add_argument("--capability", action="append", metavar="CAP",
                    choices=[*_CAP_NAMES, "any"],
                    help=f"require capability bucket (repeatable): {', '.join(_CAP_NAMES)}, any")
-    f.add_argument("--hid-bucket", action="append", choices=list(_BUCKETS),
-                   dest="hid_bucket", metavar="BUCKET", help="strong/candidate/weak/none")
-    f.add_argument("--min-hid-score", type=int, metavar="N", dest="min_hid_score")
-    f.add_argument("--creates-user-device", action="store_true", dest="creates_user_device",
-                   help="hid_input.creates_user_device is true")
+
+    # the three triage axes
+    f.add_argument("--verdict", action="append", choices=list(_VERDICTS),
+                   metavar="VERDICT", help="match/candidate/virtual_hid/none (repeatable)")
+    f.add_argument("--min-rank", type=int, metavar="N", dest="min_rank",
+                   help="hid_input.rank >= N (match=3, candidate=2, virtual_hid=1, none=0)")
+    f.add_argument("--direct-injection", action="store_true", dest="direct_injection",
+                   help="drives the input class stack directly (axis 3)")
+    f.add_argument("--user-mode-interface", action="store_true", dest="user_mode_interface",
+                   help="exposes a user-mode control interface (axis 1)")
+    f.add_argument("--virtual-hid", action="store_true", dest="virtual_hid",
+                   help="is a virtual HID device (axis 2 — disqualifies as target)")
+    f.add_argument("--no-virtual-hid", action="store_true", dest="no_virtual_hid",
+                   help="is NOT a virtual HID device")
+
     f.add_argument("--signed", action="store_true", help="has embedded Authenticode")
     f.add_argument("--unsigned", action="store_true", help="no embedded Authenticode")
+    f.add_argument("--signer", metavar="SUBSTR", help="signer common-name contains (ci)")
     f.add_argument("--loldrivers", action="store_true", help="known in the LOLDrivers snapshot")
     f.add_argument("--wx", action="store_true", help="has a writable+executable section")
     f.add_argument("--driver", action="store_true", help="PE looks like a kernel driver")
-    f.add_argument("--overlay", action="store_true", help="has appended overlay data")
+    f.add_argument("--native", action="store_true", help="native subsystem (subsystem 1)")
     f.add_argument("--min-entropy", type=float, metavar="H", dest="min_entropy")
     f.add_argument("--max-entropy", type=float, metavar="H", dest="max_entropy")
-    f.add_argument("--import", action="append", dest="import_", metavar="SUBSTR",
-                   help="imported function name contains (ci; repeatable = AND)")
-    f.add_argument("--export", action="append", metavar="SUBSTR",
-                   help="exported name contains (ci; repeatable = AND)")
-    f.add_argument("--string", action="append", metavar="SUBSTR",
-                   help="any extracted string contains (ci; repeatable = AND)")
-    f.add_argument("--url", metavar="SUBSTR", help="interesting URL contains (ci)")
-    f.add_argument("--guid", metavar="SUBSTR", help="interesting GUID contains (ci)")
-    f.add_argument("--device-path", metavar="SUBSTR", dest="device_path",
-                   help="interesting device path contains (ci)")
+    f.add_argument("--imphash", metavar="SUBSTR", help="imphash contains (ci)")
+    f.add_argument("--pdb", metavar="SUBSTR", help="CodeView PDB path contains (ci)")
+    f.add_argument("--symlink", metavar="SUBSTR",
+                   help="evidence symbolic-link path contains (ci)")
+    f.add_argument("--device", metavar="SUBSTR",
+                   help="evidence device name contains (ci)")
+    f.add_argument("--class-guid", metavar="SUBSTR", dest="class_guid",
+                   help="evidence HID class GUID name contains (ci)")
 
     # output
     o = ap.add_argument_group("output")
@@ -460,8 +493,6 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--csv", action="store_true", help="emit a CSV with the selected fields")
     o.add_argument("--count", action="store_true", help="print only the number of matches")
     o.add_argument("--stats", action="store_true", help="print summary stats for the matches")
-    o.add_argument("--strings", action="store_true",
-                   help="include raw ascii/utf16 strings (in --show and --json)")
     o.add_argument("--fields", metavar="A,B,C",
                    help=f"columns for table/csv (default: {','.join(_DEFAULT_FIELDS)}). "
                         f"Names: {', '.join(_RESOLVERS)} or any dotted path.")
@@ -485,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
             if not any(sha.lower().startswith(a.show.lower()) for sha in folded):
                 print(f"no record matching {a.show!r}", file=sys.stderr)
             return 1
-        _print_detail(rec, a.strings)
+        _print_detail(rec)
         return 0
 
     records = list(folded.values())
@@ -502,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
             records.sort(key=lambda r: str(_field(r, a.sort)), reverse=a.desc)
     else:
         # stable, useful default: strongest HID signal first
-        records.sort(key=lambda r: (_dig(r, "hid_input.score") or 0), reverse=True)
+        records.sort(key=lambda r: (_hid(r).get("rank") or 0), reverse=True)
 
     if a.limit is not None:
         records = records[: max(0, a.limit)]
@@ -514,13 +545,12 @@ def main(argv: list[str] | None = None) -> int:
         _print_stats(records)
         return 0
     if a.json:
-        json.dump([_slim_for_json(r, a.strings) for r in records], sys.stdout,
-                  ensure_ascii=False, indent=2)
+        json.dump(records, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return 0
     if a.jsonl:
         for r in records:
-            sys.stdout.write(json.dumps(_slim_for_json(r, a.strings), ensure_ascii=False) + "\n")
+            sys.stdout.write(json.dumps(r, ensure_ascii=False) + "\n")
         return 0
 
     fields = [s.strip() for s in a.fields.split(",")] if a.fields else _DEFAULT_FIELDS

@@ -1,36 +1,34 @@
 # syntax=docker/dockerfile:1
 #
 # hid-collect — stripped-down collector for Windows kernel drivers shipped with
-# HID peripherals, pulled from touslesdrivers.com. Does only collection,
-# extraction and content-addressed storage of .sys files. No signature
-# verification, no fingerprint, no scope profiles, no analyze stage.
+# HID peripherals, pulled from the Microsoft Update Catalog (WHQL-signed). Does
+# only collection, extraction and content-addressed storage of .sys files. No
+# signature verification, no fingerprint, no scope profiles, no analyze stage.
 #
 #   docker build -t hid-collect:latest .
-#   docker compose run --rm collect
+#   docker compose run --rm msupdate-catalog
 #
-# Stdlib-only Python; the only non-trivial runtime dep is 7-Zip (archive +
-# installer extraction) and curl (fallback downloader when urllib fails).
+# Mostly stdlib Python. Runtime deps: 7-Zip (archive + installer extraction),
+# curl + curl_cffi (streaming downloads), and Playwright/Chromium — the catalog
+# paginates via an ASP.NET postback that stdlib urllib cannot follow, so
+# discovery always drives a real headless browser.
 
 FROM python:3.13-slim-bookworm
-
-ARG WITH_PLAYWRIGHT=0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         p7zip-full curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Playwright + Chromium: optional, controlled by WITH_PLAYWRIGHT=1 at build time.
-# Needed only when driving the msupdate-catalog paginator through a real browser
-# (PDT_MSC_MAX_PAGES > 1). Default off keeps the image lean (~130MB vs ~1GB).
-# `playwright install --with-deps chromium` grabs ~190MB of browser plus a bunch
-# of apt libs (libxkbcommon, libnss3, libdrm, mesa, fonts); pip install adds the
-# Python module.
-RUN if [ "$WITH_PLAYWRIGHT" = "1" ]; then \
-      pip install --no-cache-dir "playwright>=1.47" \
-      && playwright install --with-deps chromium \
-      && apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    fi
+# curl_cffi: TLS/JA3 impersonation for streaming downloads. Ships a prebuilt
+# manylinux wheel with libcurl-impersonate bundled — no extra apt deps.
+# playwright: drives headless Chromium for catalog search pagination.
+RUN pip install --no-cache-dir "curl_cffi>=0.7" "playwright>=1.44"
+
+# Install the Chromium build plus its OS library dependencies. `--with-deps`
+# pulls the needed apt packages; this is the heaviest layer in the image.
+RUN playwright install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8

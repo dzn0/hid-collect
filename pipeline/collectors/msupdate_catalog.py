@@ -9,9 +9,10 @@ richest source of HID peripherals in the field, where strings like
 Flow:
 
   1. `discover()`:
-       - for each query in `PDT_MSC_QUERIES` (default: a curated HID set), GET
-         `Search.aspx?q=<query>` (first page, up to 25 hits — no ASP.NET
-         postback pagination; we lean on query diversity instead for speed).
+       - for each query in `PDT_MSC_QUERIES` (default: a curated HID set), drive
+         a headless Chromium through `Search.aspx?q=<query>` and click the
+         "next page" postback until the query is exhausted or `PDT_MSC_MAX_PAGES`
+         is hit — every page is 25 rows, the catalog caps a search at 1000.
        - parse `<tr id=\"<UID>_R<N>\">` rows into {uid, title, product,
          classification, date, version, size}.
        - keep only rows whose title or classification matches the HID shape
@@ -38,13 +39,27 @@ Environment knobs:
 - `PDT_MSC_REFRESH=1`                               ignore download ledger
 - `PDT_MSC_REFRESH_DISCOVERY=1`                     ignore discovery cache
 - `PDT_MSC_DISCOVERY_TTL_DAYS` (int)                default: 7
-- `PDT_MSC_MAX_PAGES`       (int)                   default: 1 (urllib, no paging)
-                                                    `>1` activates Playwright
-                                                    pagination (requires `playwright`
-                                                    + `chromium` in the image)
-- `PDT_MSC_BROWSER_WORKERS` (int)                   default: 3 (parallel browsers
+- `PDT_MSC_MAX_PAGES`       (int)                   default: 40 (pages per query;
+                                                    the catalog caps a search at
+                                                    40 pages × 25 = 1000 results)
+- `PDT_MSC_BROWSER_WORKERS` (int)                   default: 6 (parallel browsers
                                                     for pagination; each is ~300MB
                                                     RAM when active)
+- `PDT_MSC_BATCH_QUERIES`   (int)                   default: browser_workers × 4
+                                                    (queries discovered per round
+                                                    before downloading what they
+                                                    found; 0 = discover all, then
+                                                    download all — old flow)
+
+`run()` interleaves the two phases: it walks the queries in batches, and after
+each batch downloads what that batch turned up before moving on — so drivers
+start landing early instead of after all 595 queries finish. A discovery-cache
+hit or `PDT_MSC_BATCH_QUERIES=0` falls back to the plain discover→acquire flow.
+
+Discovery always drives a real headless Chromium (Playwright): the catalog's
+"next page" is an ASP.NET `__doPostBack`, not a URL, and stdlib urllib cannot
+follow it (it gets a generic 500 after one hop). `playwright` + its chromium
+build must therefore be present in the image.
 """
 from __future__ import annotations
 import collections
@@ -54,11 +69,13 @@ import os
 import re
 import threading
 import time
+import traceback
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from .. import __version__ as PIPELINE_VERSION
 from .. import config
 from .. import progress
 from .base import Collector
@@ -358,39 +375,31 @@ class MsUpdateCatalogCollector(Collector):
         self.crawl_jobs = _env_int("PDT_MSC_CRAWL_JOBS", 12)
         self.max_packs = _env_int("PDT_MSC_MAX_PACKS", 0)
         self.max_mb = _env_int("PDT_MSC_MAX_MB", 100)
-        self.max_pages = max(1, _env_int("PDT_MSC_MAX_PAGES", 1))
-        self.browser_workers = max(1, _env_int("PDT_MSC_BROWSER_WORKERS", 3))
+        self.max_pages = max(1, _env_int("PDT_MSC_MAX_PAGES", 40))
+        self.browser_workers = max(1, _env_int("PDT_MSC_BROWSER_WORKERS", 6))
+        # Interleave size: how many queries to discover before pausing to download
+        # what they turned up (then loop back for the next batch). Default keeps
+        # every browser busy for a few queries per round. 0 disables the loop —
+        # discover everything, then download everything (the old two-phase flow).
+        self.batch_queries = _env_int("PDT_MSC_BATCH_QUERIES",
+                                      max(self.browser_workers * 4, 1))
         self._lock = threading.Lock()
         self._ledger_lock = threading.Lock()
         self._urls: list[str] = []
         self._url_source: dict[str, dict] = {}
+        self._resolved_uids: set[str] = set()
 
     # ----- discovery -----
 
-    def _get_text(self, url: str, timeout: int = 30) -> str:
-        req = Request(url, headers={"User-Agent": C.UA})
-        with urlopen(req, timeout=timeout) as r:
-            return r.read(16 << 20).decode("utf-8", "replace")
-
-    def _search(self, query: str) -> list[dict]:
-        url = f"{BASE}/Search.aspx?q=" + urllib.parse.quote(query)
-        try:
-            html = self._get_text(url)
-        except Exception:
-            return []
-        rows = [_parse_row(uid, inner) for uid, inner in RX_ROW.findall(html)]
-        for r in rows:
-            r["query"] = query
-        return rows
-
     def _search_paged_chunk(self, queries: list[str],
                             rep_fn, cnt_fn, slot_fn) -> list[dict]:
-        """Walk N pages per query via Playwright. One browser per chunk, serial.
+        """Walk up to `max_pages` pages per query via Playwright. One browser per
+        chunk, serial.
 
         The catalog's ASP.NET postback (ctl00$catalogBody$nextPageLinkText) is
         blocked for urllib — it returns a generic 500 error page after one hop.
-        A real browser passes through fine, so we drive Chromium headless when
-        `PDT_MSC_MAX_PAGES > 1`. Fallback to urllib when Playwright is missing.
+        A real browser passes through fine, so discovery always drives Chromium
+        headless; Playwright + its chromium build must be present in the image.
 
         `rep_fn`/`cnt_fn`/`slot_fn` are the reporters captured on the main
         thread; we re-register them on this worker thread so per-query /
@@ -408,16 +417,13 @@ class MsUpdateCatalogCollector(Collector):
 
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
-        except ImportError:
-            # Playwright not installed: silently fall back to the 1-page urllib
-            # path so a slim image without browsers still works.
-            out = []
-            for i, q in enumerate(queries, 1):
-                progress.set_slot(slot_id, q[:_SLOT_LABEL_WIDTH])
-                progress.report(f"q {i}/{len(queries)} (urllib fallback)")
-                out.extend(self._search(q))
+        except ImportError as exc:
             progress.clear_slot()
-            return out
+            raise RuntimeError(
+                "msupdate-catalog discovery requires Playwright + chromium "
+                "(the catalog paginates via an ASP.NET postback urllib cannot "
+                "follow). Install with `pip install playwright` and "
+                "`playwright install chromium`.") from exc
         out: list[dict] = []
         try:
             with sync_playwright() as p:
@@ -550,7 +556,82 @@ class MsUpdateCatalogCollector(Collector):
         }
         p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+    def _search_all(self, queries: list[str], rows_by_uid: dict[str, dict],
+                    rep_fns=None) -> None:
+        """Fan out `queries` over the browser pool, ingesting hid-shaped rows
+        into `rows_by_uid` (deduped by UID, accumulating the matching queries).
+
+        One headless Chromium per worker; each worker walks a chunk of queries
+        serially, clicking through up to `max_pages` pages per query (the catalog
+        paginates via an ASP.NET postback urllib cannot follow)."""
+        if rep_fns is None:
+            rep_fns = progress.current_reporters()
+        rep_fn, cnt_fn, slot_fn = rep_fns
+
+        def _ingest(rows: list[dict]) -> None:
+            for row in rows:
+                if not _hid_shaped(row):
+                    continue
+                r = rows_by_uid.setdefault(row["uid"], row)
+                r.setdefault("queries", [])
+                if row["query"] not in r["queries"]:
+                    r["queries"].append(row["query"])
+
+        k = max(1, min(self.browser_workers, len(queries)))
+        chunks: list[list[str]] = [[] for _ in range(k)]
+        for i, q in enumerate(queries):
+            chunks[i % k].append(q)
+        done = 0
+        with ThreadPoolExecutor(max_workers=k) as pool:
+            futs = {pool.submit(self._search_paged_chunk, c,
+                                rep_fn, cnt_fn, slot_fn): c
+                    for c in chunks}
+            for fut in as_completed(futs):
+                _ingest(fut.result())
+                done += 1
+                progress.report(
+                    f"browser chunks: {done}/{k} · "
+                    f"{len(rows_by_uid)} hid-shaped candidate(s)")
+
+    def _resolve_new(self, rows_by_uid: dict[str, dict], seen_urls: set[str]) -> list[str]:
+        """Resolve direct CDN URLs for UIDs not yet resolved. Mutates
+        `self._resolved_uids`, `self._url_source` and `seen_urls`; returns the
+        newly-resolved URLs (deduped, in completion order)."""
+        uids = [u for u in rows_by_uid if u not in self._resolved_uids]
+        if not uids:
+            return []
+        new_urls: list[str] = []
+        rworkers = max(1, min(self.crawl_jobs, len(uids)))
+        done = 0
+
+        def resolve_one(uid: str) -> tuple[str, str | None]:
+            return uid, self._resolve_url(uid)
+
+        with ThreadPoolExecutor(max_workers=rworkers) as pool:
+            futs = {pool.submit(resolve_one, u): u for u in uids}
+            for fut in as_completed(futs):
+                done += 1
+                uid, url = fut.result()
+                self._resolved_uids.add(uid)
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    new_urls.append(url)
+                    self._url_source[url] = {
+                        "uid": uid,
+                        **{k: rows_by_uid[uid].get(k)
+                           for k in ("title", "product", "classification",
+                                     "date", "version", "size_bytes",
+                                     "queries")},
+                    }
+                progress.report(
+                    f"resolve: {done}/{len(uids)} · {len(new_urls)} new direct URLs")
+        return new_urls
+
     def discover(self) -> dict:
+        """Full two-phase discovery: walk every query, then resolve every UID.
+
+        `run()` uses the interleaved batch loop instead; this standalone path is
+        kept for direct callers and the discovery-cache-only flow."""
         cached = self._load_discovery_cache()
         if cached is not None:
             self._urls = list(cached["urls"])
@@ -567,93 +648,15 @@ class MsUpdateCatalogCollector(Collector):
             progress.report(f"discovery cache hit: {len(self._urls)} pkg URLs")
             return info
 
-        # Step 1 — fan out searches. Two paths:
-        #   * max_pages == 1: urllib, one GET per query, up to crawl_jobs
-        #     workers (very fast — ~60 GETs in parallel).
-        #   * max_pages > 1 : Playwright, one browser per worker, each worker
-        #     walks a chunk of queries serially (each query clicks through up
-        #     to max_pages pages). Fewer workers (default 3) because every
-        #     browser is RAM-heavy.
+        progress.report(
+            f"searching {len(self.queries)} queries × up to {self.max_pages} "
+            f"pages via Playwright ({self.browser_workers} browsers)")
         rows_by_uid: dict[str, dict] = {}
-
-        def _ingest(rows: list[dict]) -> None:
-            for row in rows:
-                if not _hid_shaped(row):
-                    continue
-                r = rows_by_uid.setdefault(row["uid"], row)
-                r.setdefault("queries", [])
-                if row["query"] not in r["queries"]:
-                    r["queries"].append(row["query"])
-
-        if self.max_pages <= 1:
-            progress.report(f"searching {len(self.queries)} queries (1 page each)")
-            workers = max(1, min(self.crawl_jobs, len(self.queries) or 1))
-            done = 0
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(self._search, q): q for q in self.queries}
-                for fut in as_completed(futs):
-                    done += 1
-                    _ingest(fut.result())
-                    progress.report(
-                        f"searches: {done}/{len(self.queries)} · "
-                        f"{len(rows_by_uid)} hid-shaped candidate(s)")
-        else:
-            progress.report(
-                f"searching {len(self.queries)} queries × up to {self.max_pages} "
-                f"pages via Playwright ({self.browser_workers} browsers)")
-            # Capture the main thread's reporters so each browser worker can
-            # re-register them on its own thread — per-query/per-page progress
-            # otherwise never reaches the live renderer (channel is thread-local).
-            rep_fn, cnt_fn, slot_fn = progress.current_reporters()
-            # Split queries evenly across browser workers.
-            k = max(1, min(self.browser_workers, len(self.queries)))
-            chunks: list[list[str]] = [[] for _ in range(k)]
-            for i, q in enumerate(self.queries):
-                chunks[i % k].append(q)
-            done = 0
-            with ThreadPoolExecutor(max_workers=k) as pool:
-                futs = {pool.submit(self._search_paged_chunk, c,
-                                    rep_fn, cnt_fn, slot_fn): c
-                        for c in chunks}
-                for fut in as_completed(futs):
-                    _ingest(fut.result())
-                    done += 1
-                    progress.report(
-                        f"browser chunks: {done}/{k} · "
-                        f"{len(rows_by_uid)} hid-shaped candidate(s)")
-        uids = list(rows_by_uid.keys())
-
-        # Step 2 — resolve each UID's direct CDN URL in parallel.
-        progress.report(f"resolving {len(uids)} download URLs")
-        urls: list[str] = []
+        self._search_all(list(self.queries), rows_by_uid)
+        progress.report(f"resolving {len(rows_by_uid)} download URLs")
         seen: set[str] = set()
-        url_source: dict[str, dict] = {}
-        done = 0
-        rworkers = max(1, min(self.crawl_jobs, len(uids) or 1))
-
-        def resolve_one(uid: str) -> tuple[str, str | None]:
-            return uid, self._resolve_url(uid)
-
-        with ThreadPoolExecutor(max_workers=rworkers) as pool:
-            futs = {pool.submit(resolve_one, u): u for u in uids}
-            for fut in as_completed(futs):
-                done += 1
-                uid, url = fut.result()
-                if url and url not in seen:
-                    seen.add(url)
-                    urls.append(url)
-                    url_source[url] = {
-                        "uid": uid,
-                        **{k: rows_by_uid[uid].get(k)
-                           for k in ("title", "product", "classification",
-                                     "date", "version", "size_bytes",
-                                     "queries")},
-                    }
-                progress.report(
-                    f"resolve: {done}/{len(uids)} · {len(urls)} direct URLs")
-
+        urls = self._resolve_new(rows_by_uid, seen)
         self._urls = urls[: self.max_packs] if self.max_packs else urls
-        self._url_source = url_source
         info = {
             "discovery_page": BASE + "/",
             "installer_url": None,
@@ -663,26 +666,167 @@ class MsUpdateCatalogCollector(Collector):
             "jobs": self.jobs,
             "max_mb": self.max_mb,
         }
-        self._save_discovery_cache(info, urls, url_source)
+        self._save_discovery_cache(info, self._urls, self._url_source)
         info["discovery_cache"] = {
             "hit": False, "saved_at": C.utc_now(),
             "path": str(self._discovery_cache_path()),
         }
         return info
 
+    # ----- interleaved run: discover a batch → download it → next batch -----
+
+    def run(self) -> dict:
+        """Override the base one-shot discover→acquire with an interleaved loop.
+
+        The default source has 595 queries; discovering all of them before any
+        download means nothing lands for a long time. Instead we walk the queries
+        in batches of `batch_queries`: discover a batch, resolve + download what
+        it turned up, then loop to the next batch — so drivers start arriving
+        early and discovery overlaps download. A discovery-cache hit or
+        `batch_queries <= 0` falls back to the plain discover()+acquire() path."""
+        run_id = C.utc_now_compact()
+        work_dir = config.collectors_dir() / self.name / run_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        C.sweep_stale_work(work_dir.parent, run_id)
+        manifest: dict = {
+            "schema_version": 1, "collector": self.name,
+            "collector_role": self.role, "pipeline_version": PIPELINE_VERSION,
+            "run_id": run_id, "started_at": C.utc_now(),
+            "allowed_hosts": list(self.allowed_hosts), "status": "pending",
+            "discovery": None, "downloads": [], "drivers": [], "error": None,
+        }
+        try:
+            cached = self._load_discovery_cache()
+            if cached is not None or self.batch_queries <= 0:
+                # Cache hit, or loop disabled: plain two-phase flow.
+                info = self.discover()
+                drivers = self.acquire(work_dir, info)
+                manifest["downloads"].extend(info.pop("downloads_top", []))
+                self._attach_and_index(drivers, info)
+                manifest["drivers"] = drivers
+                manifest["discovery"] = info
+            else:
+                drivers, info = self._run_interleaved(work_dir, manifest)
+                manifest["drivers"] = drivers
+                manifest["discovery"] = info
+            manifest["status"] = "success" if manifest["drivers"] else "no_driver_extracted"
+        except Exception as exc:
+            manifest["status"] = "failed"
+            manifest["error"] = {"type": type(exc).__name__, "message": str(exc),
+                                 "traceback": traceback.format_exc()}
+        finally:
+            manifest["finished_at"] = C.utc_now()
+            C.save_json(work_dir / "manifest.json", manifest)
+            self._update_latest(work_dir)
+        return manifest
+
+    def _run_interleaved(self, work_dir: Path, manifest: dict) -> tuple[list[dict], dict]:
+        refresh = os.environ.get("PDT_MSC_REFRESH", "") not in ("", "0", "false")
+        processed = set() if refresh else self._load_ledger()
+        ledger_at_start = len(processed)
+
+        rows_by_uid: dict[str, dict] = {}
+        seen_urls: set[str] = set()
+        all_rows: list[dict] = []
+        downloads: list[dict] = []
+        errors: list[dict] = []
+        stats = {"found": 0, "attempted": 0, "packages": 0, "sys": 0,
+                 "no_sys": 0, "skipped_seen": 0, "failed": 0}
+
+        queries = list(self.queries)
+        bs = self.batch_queries
+        batches = [queries[i:i + bs] for i in range(0, len(queries), bs)]
+        n_batches = len(batches)
+        progress.report(
+            f"interleaved sweep: {len(queries)} queries in {n_batches} batch(es) "
+            f"of {bs} × up to {self.max_pages} pages ({self.browser_workers} browsers)")
+
+        for bi, batch in enumerate(batches, 1):
+            if self.max_packs and len(self._urls) >= self.max_packs:
+                break
+            progress.report(f"batch {bi}/{n_batches}: discovering {len(batch)} queries")
+            self._search_all(batch, rows_by_uid)
+            new_urls = self._resolve_new(rows_by_uid, seen_urls)
+            if self.max_packs:
+                room = self.max_packs - len(self._urls)
+                new_urls = new_urls[: max(0, room)]
+            self._urls.extend(new_urls)
+            stats["found"] = len(self._urls)
+            if not new_urls:
+                continue
+            progress.report(f"batch {bi}/{n_batches}: downloading {len(new_urls)} pack(s)")
+            batch_rows = self._download_batch(work_dir, new_urls, processed,
+                                              downloads, errors, stats)
+            if batch_rows:
+                info_stub = {"discovery_page": BASE + "/", "installer_url": None}
+                self._attach_and_index(batch_rows, info_stub)
+                all_rows.extend(batch_rows)
+                manifest["drivers"] = all_rows  # live-update for crash safety
+            manifest["downloads"] = downloads
+
+        # Persist the full discovered universe for next run's cache.
+        info = {
+            "discovery_page": BASE + "/", "installer_url": None,
+            "queries": queries, "hits": len(rows_by_uid),
+            "packs_resolved": len(self._urls), "jobs": self.jobs,
+            "max_mb": self.max_mb, "batches": n_batches,
+            "batch_queries": bs, "interleaved": True,
+            "stats": stats, "errors": errors[:500], "error_count": len(errors),
+            "ledger_at_start": ledger_at_start,
+            "resumed": (not refresh) and stats["skipped_seen"] > 0,
+        }
+        self._save_discovery_cache(
+            {k: info[k] for k in ("discovery_page", "installer_url", "queries",
+                                  "hits", "packs_resolved", "jobs", "max_mb")},
+            self._urls, self._url_source)
+        info["discovery_cache"] = {
+            "hit": False, "saved_at": C.utc_now(),
+            "path": str(self._discovery_cache_path()),
+        }
+        return all_rows, info
+
+    def _attach_and_index(self, drivers: list[dict], info: dict) -> None:
+        """Mirror the base framework: stamp source provenance onto each driver and
+        append it to the store index (the analysis line was written at store
+        time; this adds origin)."""
+        for d in drivers:
+            d.setdefault("provenance", {}).update({
+                "source": self.name,
+                "discovery_page": info.get("discovery_page"),
+                "installer_url": info.get("installer_url"),
+            })
+            C.append_index(config.drivers_dir(),
+                           {"sha256": d["sha256"], "provenance": d.get("provenance")})
+
     # ----- acquisition -----
 
     def acquire(self, work_dir: Path, info: dict) -> list[dict]:
         refresh = os.environ.get("PDT_MSC_REFRESH", "") not in ("", "0", "false")
         processed = set() if refresh else self._load_ledger()
-        urls = self._urls
 
-        rows: list[dict] = []
         errors: list[dict] = []
         downloads: list[dict] = []
-        stats = {"found": len(urls), "attempted": 0, "packages": 0, "sys": 0,
+        stats = {"found": len(self._urls), "attempted": 0, "packages": 0, "sys": 0,
                  "no_sys": 0, "skipped_seen": 0, "failed": 0}
 
+        rows = self._download_batch(work_dir, self._urls, processed,
+                                    downloads, errors, stats)
+
+        info["stats"] = stats
+        info["errors"] = errors[:500]
+        info["error_count"] = len(errors)
+        info["downloads_top"] = downloads
+        info["ledger_at_start"] = len(processed)
+        info["resumed"] = (not refresh) and stats["skipped_seen"] > 0
+        return rows
+
+    def _download_batch(self, work_dir: Path, urls: list[str], processed: set[str],
+                        downloads: list[dict], errors: list[dict],
+                        stats: dict) -> list[dict]:
+        """Download + extract a set of resolved URLs in parallel. Shared by the
+        interleaved loop and the standalone acquire(). Mutates `downloads`,
+        `errors`, `stats` and `processed`; returns the driver rows collected."""
+        rows: list[dict] = []
         rep_fn, cnt_fn, slot_fn = progress.current_reporters()
 
         def key_of(url: str) -> str:
@@ -704,6 +848,7 @@ class MsUpdateCatalogCollector(Collector):
                         stats["skipped_seen"] += 1
                     return
                 with self._lock:
+                    processed.add(key)
                     stats["attempted"] += 1
                 got, rec = self._fetch(work_dir, url)
                 if got is None:
@@ -727,13 +872,6 @@ class MsUpdateCatalogCollector(Collector):
 
         with ThreadPoolExecutor(max_workers=self.jobs) as pool:
             list(pool.map(handle, urls))
-
-        info["stats"] = stats
-        info["errors"] = errors[:500]
-        info["error_count"] = len(errors)
-        info["downloads_top"] = downloads
-        info["ledger_at_start"] = len(processed)
-        info["resumed"] = (not refresh) and stats["skipped_seen"] > 0
         return rows
 
     def _fetch(self, work_dir: Path, url: str):

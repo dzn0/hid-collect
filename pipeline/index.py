@@ -6,23 +6,32 @@ alongside it: as each new binary is stored, collection appends one *analysis*
 line, and later one or more *provenance* lines once origin is known. Nothing is
 executed — binaries are parsed purely as bytes (no disassembly, no emulation).
 
-Each analysis line is a JSON object keyed by `sha256` carrying everything useful
-for triage and reverse-engineering that can be read statically:
+The index has ONE job: decide, from bytes alone, which drivers are worth pulling
+into a disassembler / decompiler. It is a triage filter, not an archive — so each
+analysis line is deliberately lean: just enough identity to recognise a binary,
+plus the signals that answer the project's question, and nothing that belongs in
+the decompiler instead (no raw import table, no string dumps, no section maps).
 
-  * **hashes**  — md5, sha1, imphash, file + per-section entropy
-  * **pe**      — machine/arch, subsystem, timestamp, linker, image base, entry
-                  point, checksum (+validity), image/DLL characteristics (NX,
-                  ASLR, CFG), data directories, sections (perms + entropy)
-  * **apis**    — imports grouped by DLL, capability buckets, dangerous subset,
-                  exports
-  * **debug**   — CodeView PDB path + GUID/age (original build path)
-  * **version** — VS_VERSIONINFO (company, product, original filename, versions)
-  * **signature** — embedded Authenticode presence + certificate common names
-  * **strings** — deduped ASCII/UTF-16 plus a curated interesting subset
-                  (device paths, registry keys, GUIDs, URLs, other .sys)
-  * **hid_input** — a signal set + score for the project's question: does this
-                  driver look able to inject mouse/keyboard input from user mode,
-                  bypassing the legitimate HID stack?
+The question, stated precisely. We hunt a driver that:
+  1. exposes a **user-mode control interface** — a device + symbolic link user
+     mode can open and drive with IOCTLs;
+  2. is **not a virtual HID device** — it does NOT present synthetic input the
+     legitimate way (Virtual HID Framework / HID minidriver); and
+  3. **injects mouse/keyboard input by driving the class stack directly** —
+     calling MouseClassServiceCallback (or attaching to \\Device\\PointerClass0)
+     with crafted MOUSE_INPUT_DATA, bypassing the real HID stack.
+
+Each analysis line is a JSON object keyed by `sha256`:
+
+  * **identity** — size, md5, imphash, file entropy; and under `pe`: arch,
+    is_driver/native, signed + signer CN(s), W^X section flag, export count,
+    CodeView PDB path, and a few VS_VERSIONINFO fields (company/product/…)
+  * **capabilities** — curated kernel-primitive buckets (phys_mem, port_io,
+    msr_control_reg, process_access, device_io, input_injection)
+  * **hid_input** — the triage verdict: the three booleans above
+    (`user_mode_interface`, `virtual_hid`, `direct_injection`), a `verdict`
+    (`match`/`candidate`/`virtual_hid`/`none`) + `rank`, and the `evidence`
+    (which imports/strings/symlinks/GUIDs fired) so the call is auditable
   * **loldrivers** — cross-reference against a vendored LOLDrivers snapshot
 
 A reader folds every line sharing a `sha256` (see `fold_index`). This module also
@@ -87,22 +96,41 @@ _CAPABILITIES = {
                   "iogetdeviceobjectpointer", "obreferenceobjectbyname",
                   "iocreatedevicesecure", "wdmlibiocreatedevicesecure"},
 }
-_DANGEROUS = set().union(*_CAPABILITIES.values())
+# ── the three triage axes (byte-only) ────────────────────────────────────────
+#
+# (3) DIRECT INJECTION — driving the input class stack directly. The class
+# service callbacks are the smoking gun: a driver either imports them, or (more
+# often, to dodge trivial import scans) resolves them by name at runtime via
+# MmGetSystemRoutineAddress, so the name survives as a string too.
+_INJECT_IMPORTS = {
+    "mouseclassservicecallback", "mouclassservicecallback",
+    "keyboardclassservicecallback", "kbdclassservicecallback",
+}
+_INJECT_STRINGS = {
+    "mouseclassservicecallback", "mouclassservicecallback",
+    "keyboardclassservicecallback", "kbdclassservicecallback",
+    "mouse_input_data", "keyboard_input_data",
+    "\\driver\\mouclass", "\\driver\\kbdclass",
+    "\\driver\\mouhid", "\\driver\\kbdhid",
+}
+# class device objects an injector attaches to / targets directly
+_CLASS_DEVICE_STRINGS = {"\\device\\pointerclass", "\\device\\keyboardclass"}
+# the attach-to-class-stack primitive (alternative to calling the callback)
+_ATTACH_IMPORTS = {"iogetdeviceobjectpointer", "ioattachdevicetodevicestack"}
 
-# ---- the project's actual question: user-mode -> mouse/keyboard, no HID stack --
-_HID_STRING_SIGNALS = {
-    "mouseclassservicecallback": 5, "mouclassservicecallback": 5,
-    "keyboardclassservicecallback": 5, "kbdclassservicecallback": 5,
-    "\\driver\\mouclass": 4, "\\driver\\kbdclass": 4,
-    "\\device\\pointerclass": 4, "\\device\\keyboardclass": 4,
-    "mouse_input_data": 3, "keyboard_input_data": 3,
-    "mouclass": 2, "kbdclass": 2, "pointerclass": 2, "keyboardclass": 2,
-    "mouhid": 2, "kbdhid": 2, "hidclass": 1, "\\device\\rawinput": 2,
-}
-_HID_IMPORT_SIGNALS = {
-    "iocreatedevice", "iocreatesymboliclink", "ioattachdevicetodevicestack",
-    "iogetdeviceobjectpointer", "obreferenceobjectbyname",
-}
+# (1) USER-MODE INTERFACE — a device plus a symbolic link user mode can open.
+_CREATE_DEVICE_IMPORTS = {"iocreatedevice", "iocreatedevicesecure",
+                          "wdmlibiocreatedevicesecure"}
+_SYMLINK_IMPORT = "iocreatesymboliclink"
+
+# (2) VIRTUAL HID — the *legitimate* way to present synthetic input. Its presence
+# disqualifies a driver as the abuse primitive we hunt (it is doing it the right
+# way). VHF = Virtual HID Framework; a HID minidriver links hidclass/hidparse.
+_VHF_IMPORTS = {"vhfcreate", "vhfstart", "vhfreadreportsubmit", "vhfdeletedevice",
+                "vhfasleep", "vhfresume"}
+_HID_MINIDRIVER_IMPORTS = {"hidregisterminidriver"}
+_HID_CLASS_DLLS = {"hidclass.sys", "hidparse.sys", "vhf.sys"}
+
 _HID_CLASS_GUIDS = {
     "4d36e96f-e325-11ce-bfc1-08002be10318": "GUID_CLASS_MOUSE",
     "4d36e96b-e325-11ce-bfc1-08002be10318": "GUID_CLASS_KEYBOARD",
@@ -116,8 +144,6 @@ _ASCII_PAT = rb"[\x20-\x7e]{%d,}"
 _UTF16_PAT = rb"(?:[\x20-\x7e]\x00){%d,}"
 _GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                       r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-_SYS_RE = re.compile(r"[\w\-]{1,64}\.sys", re.I)
-_URL_RE = re.compile(r"https?://[^\s\"'<>]{4,200}")
 
 _LOL: dict | None = None
 
@@ -511,65 +537,82 @@ def _cert_cns(der: bytes) -> list[str]:
 # ------------------------------------------------------------------- strings
 
 
-def extract_strings(data: bytes, min_len: int = 5, max_count: int = 3000) -> dict:
+def extract_strings(data: bytes, min_len: int = 5) -> list[str]:
+    """All printable ASCII + UTF-16LE runs, deduped and sorted. Used only to
+    derive signals — the raw list is never stored in the index."""
     a = {m.group().decode("ascii", "replace")
          for m in re.finditer(_ASCII_PAT % min_len, data)}
     u = {m.group().decode("utf-16-le", "replace")
          for m in re.finditer(_UTF16_PAT % min_len, data)}
-    u -= a
-    asc, wide = sorted(a), sorted(u)
-    truncated = len(asc) > max_count or len(wide) > max_count
-    return {"ascii": asc[:max_count], "utf16": wide[:max_count],
-            "count": len(a) + len(u), "truncated": truncated}
-
-
-def interesting_strings(all_strs: list[str]) -> dict:
-    dev, reg, guids, urls, syss = set(), set(), set(), set(), set()
-    for s in all_strs:
-        low = s.lower()
-        if "\\device\\" in low or "\\??\\" in low or "\\dosdevices\\" in low \
-                or "\\driver\\" in low:
-            dev.add(s.strip())
-        if "\\registry\\" in low or "currentcontrolset" in low or low.startswith("hkey"):
-            reg.add(s.strip())
-        for g in _GUID_RE.findall(s):
-            guids.add(g.lower())
-        for u in _URL_RE.findall(s):
-            urls.add(u)
-        for sy in _SYS_RE.findall(s):
-            syss.add(sy.lower())
-    return {"device_paths": sorted(dev)[:100], "registry": sorted(reg)[:100],
-            "guids": sorted(guids)[:100], "urls": sorted(urls)[:50],
-            "other_sys": sorted(syss)[:100]}
+    return sorted(a | u)
 
 
 # ----------------------------------------------------------- HID-input signals
 
 
-def hid_input_signals(imports_flat: set[str], all_strs_low: list[str],
-                      guids: set[str]) -> dict:
-    joined = "\n".join(all_strs_low)
-    str_hits = {sig: w for sig, w in _HID_STRING_SIGNALS.items() if sig in joined}
-    imp_hits = sorted(imports_flat & _HID_IMPORT_SIGNALS)
-    guid_hits = {g: _HID_CLASS_GUIDS[g] for g in guids if g in _HID_CLASS_GUIDS}
-    creates_device = {"iocreatedevice", "iocreatedevicesecure",
-                      "wdmlibiocreatedevicesecure"} & imports_flat and \
-        "iocreatesymboliclink" in imports_flat
-    score = sum(str_hits.values()) + 2 * len(guid_hits) + len(imp_hits) + \
-        (2 if creates_device else 0)
-    strong = any(w >= 5 for w in str_hits.values())
-    if strong or score >= 8:
-        bucket = "strong"
-    elif score >= 4:
-        bucket = "candidate"
-    elif score >= 1:
-        bucket = "weak"
+def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
+                      strings_low: list[str], guids: set[str],
+                      symlinks: list[str], device_names: list[str]) -> dict:
+    """Score the three triage axes and return a verdict + auditable evidence.
+
+    The target is a driver that injects input by driving the class stack directly
+    (axis 3) AND is reachable from user mode (axis 1) AND is NOT a virtual HID
+    device (axis 2 — the legitimate path, which disqualifies)."""
+    joined = "\n".join(strings_low)
+
+    # (3) direct input-stack injection
+    inj_imports   = sorted(imports_flat & _INJECT_IMPORTS)
+    inj_strings   = sorted(s for s in _INJECT_STRINGS if s in joined)
+    class_targets = sorted(s for s in _CLASS_DEVICE_STRINGS if s in joined)
+    class_attach  = _ATTACH_IMPORTS.issubset(imports_flat) and bool(class_targets)
+    direct_injection = bool(inj_imports or inj_strings or class_attach)
+
+    # (1) user-mode control interface (device + openable symbolic link)
+    creates_device = bool(imports_flat & _CREATE_DEVICE_IMPORTS) and \
+        _SYMLINK_IMPORT in imports_flat
+    user_mode_interface = creates_device or bool(symlinks)
+
+    # (2) virtual HID device — the legitimate path; disqualifies as our target
+    vhf = sorted(imports_flat & _VHF_IMPORTS)
+    hid_minidriver = bool(imports_flat & _HID_MINIDRIVER_IMPORTS) or \
+        bool(imported_dlls & _HID_CLASS_DLLS)
+    virtual_hid = bool(vhf or hid_minidriver)
+
+    guid_hits = sorted({_HID_CLASS_GUIDS[g] for g in guids if g in _HID_CLASS_GUIDS})
+    input_adjacent = bool(class_targets or guid_hits or any(
+        t in joined for t in ("mouclass", "kbdclass", "pointerclass", "keyboardclass")))
+
+    if direct_injection and not virtual_hid and user_mode_interface:
+        verdict = "match"          # the full primitive — decompile this
+    elif direct_injection and not virtual_hid:
+        verdict = "candidate"      # injects directly, interface unconfirmed
+    elif virtual_hid:
+        verdict = "virtual_hid"    # legitimate synthetic-input path — filter out
+    elif user_mode_interface and input_adjacent:
+        verdict = "candidate"      # user-mode device touching the input class
     else:
-        bucket = "none"
-    return {"score": score, "bucket": bucket,
-            "string_hits": sorted(str_hits), "import_hits": imp_hits,
-            "class_guids": sorted(guid_hits.values()),
-            "creates_user_device": bool(creates_device)}
+        verdict = "none"
+    rank = {"match": 3, "candidate": 2, "virtual_hid": 1, "none": 0}[verdict]
+
+    return {
+        "verdict": verdict,
+        "rank": rank,
+        "direct_injection": direct_injection,
+        "user_mode_interface": user_mode_interface,
+        "virtual_hid": virtual_hid,
+        "evidence": {
+            "injection_imports": inj_imports,
+            "injection_strings": inj_strings,
+            "class_stack_attach": class_attach,
+            "class_device_targets": class_targets,
+            "creates_user_device": creates_device,
+            "symlinks": symlinks[:12],
+            "device_names": device_names[:8],
+            "vhf_imports": vhf,
+            "hid_minidriver": hid_minidriver,
+            "class_guids": guid_hits,
+        },
+    }
 
 
 # ------------------------------------------------------------------ loldrivers
@@ -604,70 +647,73 @@ def loldrivers_match(sha256: str, imphash: str | None) -> dict:
 # ----------------------------------------------------------------- analysis
 
 
-def analyze_binary(path: Path, *, min_str: int = 5, max_str: int = 3000) -> dict:
-    """Full byte-derived analysis line for a stored binary (sha256 = filename)."""
+_VI_FIELDS = ("CompanyName", "ProductName", "FileDescription",
+              "OriginalFilename", "FileVersion")
+
+
+def analyze_binary(path: Path, *, min_str: int = 5) -> dict:
+    """Lean, triage-focused analysis line for a stored binary (sha256 = filename).
+
+    Deliberately omits the raw import table, string dumps, section maps and other
+    bulk that belongs in a disassembler — the index only carries identity, the
+    capability buckets, and the three-axis HID verdict used to pick what to open."""
     data = path.read_bytes()
     entry: dict = {
         "sha256": path.stem,
         "kind": "analysis",
         "size": len(data),
         "md5": hashlib.md5(data).hexdigest(),
-        "sha1": hashlib.sha1(data).hexdigest(),
         "entropy": _entropy(data),
     }
+
+    # Strings feed the signals (callbacks resolved by name, device/symlink paths,
+    # GUIDs) but are never stored raw.
+    strs = extract_strings(data, min_str)
+    strs_low = [s.lower() for s in strs]
+    guids = {g.lower() for s in strs for g in _GUID_RE.findall(s)}
+    symlinks = sorted({s.strip() for s in strs
+                       if "\\dosdevices\\" in s.lower() or "\\??\\" in s.lower()})
+    device_names = sorted({s.strip() for s in strs if "\\device\\" in s.lower()})
+
     pe = PE(data)
     imphash = None
     imports_flat: set[str] = set()
+    imported_dlls: set[str] = set()
     if pe.ok:
         try:
             imports = pe.imports()
+            imported_dlls = {d.lower() for d in imports}
             imports_flat = {f.lower() for fns in imports.values() for f in fns}
-            flat_sorted = sorted({f for fns in imports.values() for f in fns})
             imphash = pe.imphash()
             caps = {cat: sorted(imports_flat & names)
                     for cat, names in _CAPABILITIES.items()
                     if imports_flat & names}
-            overlay = _overlay(pe, data)
+            hdr = pe.header()
+            sig = pe.signature()
+            dbg = pe.debug() or {}
+            vi = (pe.resources().get("version_info") or {})
             entry["pe"] = {
-                **pe.header(),
-                "sections": pe.sections_info(),
-                "imports": imports,
-                "import_dll_count": len(imports),
-                "api_count": len(flat_sorted),
-                "dangerous_imports": [f for f in flat_sorted if f.lower() in _DANGEROUS],
-                "capabilities": caps,
-                "exports": pe.exports()[:512],
+                "arch": hdr["arch"],
+                "is_driver": hdr["is_driver"],
+                "native": hdr["native"],
+                "signed": bool(sig.get("embedded")),
+                "signers": sig.get("cert_common_names") or [],
+                "wx": any(s.get("wx") for s in pe.sections_info()),
+                "exports": len(pe.exports()),
                 "imphash": imphash,
-                "debug": pe.debug(),
-                "resources": pe.resources(),
-                "signature": pe.signature(),
-                "overlay": overlay,
+                "pdb": dbg.get("pdb"),
+                "capabilities": caps,
+                "info": {k.lower(): vi[k] for k in _VI_FIELDS if vi.get(k)},
             }
         except Exception as exc:  # never let one sub-parser sink the line
             entry["pe"] = {"parse_error": f"{type(exc).__name__}: {exc}"}
     else:
         entry["pe"] = None
 
-    strings = extract_strings(data, min_str, max_str)
-    entry["strings"] = strings
-    all_strs = strings["ascii"] + strings["utf16"]
-    inter = interesting_strings(all_strs)
-    entry["interesting_strings"] = inter
     entry["hid_input"] = hid_input_signals(
-        imports_flat, [s.lower() for s in all_strs], set(inter["guids"]))
+        imports_flat, imported_dlls, strs_low, guids, symlinks, device_names)
     entry["loldrivers"] = loldrivers_match(path.stem, imphash)
     return entry
-
-
-def _overlay(pe: PE, data: bytes) -> dict | None:
-    try:
-        end = max((s["rawptr"] + s["rawsize"] for s in pe.sections), default=0)
-        if 0 < end < len(data):
-            blob = data[end:]
-            return {"offset": end, "size": len(blob), "entropy": _entropy(blob)}
-    except Exception:
-        return None
-    return None
 
 
 # ------------------------------------------------------------------- readers
@@ -739,8 +785,6 @@ def main(argv: list[str] | None = None) -> int:
         prog="pipeline.index",
         description="Backfill analysis lines in drivers/index.jsonl for stored binaries.")
     ap.add_argument("--min-str", type=int, default=5, help="minimum string length (default 5)")
-    ap.add_argument("--max-str", type=int, default=3000,
-                    help="max strings per bucket per driver (default 3000)")
     ap.add_argument("--rebuild", action="store_true",
                     help="drop existing analysis lines and re-emit them "
                          "(provenance lines are preserved)")
@@ -760,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
         if p.stem in done:
             continue
         try:
-            entry = analyze_binary(p, min_str=args.min_str, max_str=args.max_str)
+            entry = analyze_binary(p, min_str=args.min_str)
         except OSError:
             continue
         C.append_index(drivers_dir, entry)

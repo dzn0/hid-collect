@@ -1,17 +1,15 @@
 # hid-collect — minimal collector image.
 #
 #   docker compose build
-#   docker compose run --rm collect                       # list collectors
-#   docker compose run --rm run                           # sweep touslesdrivers-input
+#   docker compose run --rm collect           # list collectors
+#   docker compose run --rm msupdate-catalog  # sweep the MS Update Catalog (primary, WHQL)
 #
-# Tune the sweep via environment variables (see pipeline/collectors/touslesdrivers_input.py):
-#   PDT_HID_CATEGORIES=10,11,17,19   (keyboard, mouse, tablet, gamepad)
-#   PDT_HID_TYPES=1,4                (drivers, applications)
-#   PDT_HID_MAX_BRANDS=0 / PDT_HID_MAX_PACKS=0           (0 = unlimited)
-#   PDT_HID_JOBS=6 / PDT_HID_CRAWL_JOBS=8                (parallelism)
-#   PDT_HID_MAX_MB=60                                    (per-package size cap)
-#   PDT_HID_REFRESH=1                                    (ignore resume ledger)
-#   PDT_HID_REFRESH_DISCOVERY=1                          (re-walk brand index)
+# Tune msupdate-catalog (see pipeline/collectors/msupdate_catalog.py):
+#   PDT_MSC_QUERIES="mouse;keyboard;..."      (; separated; default curated HID bank)
+#   PDT_MSC_JOBS=8 / PDT_MSC_CRAWL_JOBS=12    (download / search+resolve workers)
+#   PDT_MSC_MAX_PACKS=0 / PDT_MSC_MAX_MB=100  (0 = unlimited; per-.cab size cap)
+#   PDT_MSC_MAX_PAGES=40                      (pages/query; catalog caps at 40×25=1000)
+#   PDT_MSC_REFRESH=1 / PDT_MSC_REFRESH_DISCOVERY=1
 #
 # pipeline_out/ is bind-mounted so the content-addressed store, the resume
 # ledger (processed.jsonl) and the discovery cache survive rebuilds.
@@ -29,61 +27,17 @@ services:
     <<: *hc-common
     command: ["pipeline.collect", "--list"]
 
-  run:
+  msupdate-catalog:
     <<: *hc-common
-    tty: true
-    command: ["pipeline.collect", "touslesdrivers-input"]
-
-  # Tight scope: only brands whose products are mouse/keyboard peripherals
-  # (plus the motherboard-gaming vendors that ship bundled HID stacks). Drops
-  # tablet/gamepad site categories entirely, then an explicit ALLOW keeps 81
-  # brands / ~5100 pkgs out of the 7796-URL universe — the slice where strings
-  # like MouseClassServiceCallback actually ship.
-  #
-  # Discovery cache and processed.jsonl are shared with `run` (same volume),
-  # so switching between the two does not re-walk the site or re-download.
-  # Microsoft Update Catalog — WHQL-signed HID / mouse / keyboard drivers.
-  # Fast: ~60 narrow queries (one page each, 25 hits max), parallel search +
-  # URL resolve + download. Shares the content-addressed store with every
-  # other collector, so sha256-collisions across sources auto-dedupe.
-  catalog:
-    <<: *hc-common
+    environment:
+      PDT_MSC_JOBS: ${PDT_MSC_JOBS:-8}
+      PDT_MSC_CRAWL_JOBS: ${PDT_MSC_CRAWL_JOBS:-12}
+      PDT_MSC_MAX_PACKS: ${PDT_MSC_MAX_PACKS:-0}
+      PDT_MSC_MAX_MB: ${PDT_MSC_MAX_MB:-100}
+      PDT_MSC_MAX_PAGES: ${PDT_MSC_MAX_PAGES:-40}
+      PDT_MSC_BROWSER_WORKERS: ${PDT_MSC_BROWSER_WORKERS:-6}
+      PDT_MSC_REFRESH: ${PDT_MSC_REFRESH:-0}
+      PDT_MSC_REFRESH_DISCOVERY: ${PDT_MSC_REFRESH_DISCOVERY:-0}
+      PDT_MSC_DISCOVERY_TTL_DAYS: ${PDT_MSC_DISCOVERY_TTL_DAYS:-7}
     tty: true
     command: ["pipeline.collect", "msupdate-catalog"]
-
-  # Deep catalog crawl: paginates up to PDT_MSC_MAX_PAGES=20 per query using a
-  # headless Chromium (the catalog's ASP.NET postback blocks urllib). Needs
-  # the Playwright+Chromium image built with `WITH_PLAYWRIGHT=1`:
-  #   docker compose build --build-arg WITH_PLAYWRIGHT=1 catalog-deep
-  # Then `docker compose run --rm catalog-deep` crawls ~60 queries × 20 pages
-  # = up to ~30k UIDs instead of ~1500 — real "overnight" scope.
-  catalog-deep:
-    <<: *hc-common
-    tty: true
-    image: hid-collect:playwright
-    build:
-      context: .
-      args:
-        WITH_PLAYWRIGHT: "1"
-    environment:
-      PDT_MSC_MAX_PAGES: "20"
-      PDT_MSC_BROWSER_WORKERS: "3"
-    command: ["pipeline.collect", "msupdate-catalog"]
-
-  tight:
-    <<: *hc-common
-    tty: true
-    environment:
-      PDT_HID_CATEGORIES: "10,11"
-      PDT_HID_BRAND_ALLOW: >-
-        microsoft,logitech,razer,steelseries,corsair,hyperx,roccat,cherry,
-        wooting,obins,mountain,akko,ducky,pulsar,mionix,endgame gear,zowie,
-        kensington,dygma,monsgeek,melgeek,kemove,klim,drevo,tesoro,viper,
-        havit,glorious,bloody,cougar,saitek,mad catz,gamdias,redragon,
-        redthunder,lexip,lamzu,alienware,aorus,asus,cooler master,evga,
-        g.skill,gigabyte,msi,nzxt,lian li,fnatic,durgod,qpad,ozone,hkg,
-        coolkiller,yunzii,dareu,zelotes,a4tech,elecom,aula,endorfy,xanova,
-        xtrfy,fox spirit,g4m3r,mojo,matrix,protoarc,rantopad,tmkb,perixx,
-        fl.esports,sog,jelly comb,easars,empire gaming,art. lebedev,hyte,
-        kfa2,be quiet!,adata,mushkin
-    command: ["pipeline.collect", "touslesdrivers-input"]
