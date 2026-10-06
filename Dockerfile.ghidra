@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+#
+# hid-collect — analysis image: Ghidra headless + the pipeline, for turning a
+# triaged binary in the store into a per-driver report folder under reports/.
+#
+#   docker compose build ghidra
+#   docker compose run --rm report --pick                 # best target + why
+#   docker compose run --rm report <sha-or-prefix>        # build reports/<sha256>/
+#
+# Ghidra needs a JDK (21+ for Ghidra 11.x); we base on Temurin 21 and add a
+# slim Python 3 for the pipeline and 7-Zip for container extraction parity.
+# The analysis code is stdlib-only, so no pip install is required at runtime.
+
+FROM eclipse-temurin:21-jdk-jammy
+
+# Pin a Ghidra public release. These must name a real release asset at
+#   github.com/NationalSecurityAgency/ghidra/releases
+# Override at build time to move the pin, e.g.:
+#   docker compose build \
+#     --build-arg GHIDRA_VERSION=11.3.2 \
+#     --build-arg GHIDRA_RELEASE=20250415 \
+#     --build-arg GHIDRA_SHA256=<sha256-of-the-zip> ghidra
+# Verified against the GitHub release asset ghidra_12.1.4_PUBLIC_20260921.zip.
+ARG GHIDRA_VERSION=12.1.4
+ARG GHIDRA_RELEASE=20260921
+# Leave empty to skip archive verification; set to the published zip SHA-256 to enforce it.
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+
+ENV GHIDRA_HOME=/opt/ghidra \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        python3 python3-pip p7zip-full unzip curl ca-certificates fontconfig \
+ && rm -rf /var/lib/apt/lists/*
+
+# Fetch and unpack Ghidra. When GHIDRA_SHA256 is non-empty the archive is
+# verified against it before extraction (build fails on mismatch).
+RUN set -eux; \
+    url="https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_RELEASE}.zip"; \
+    curl -fSL "$url" -o /tmp/ghidra.zip; \
+    if [ -n "${GHIDRA_SHA256}" ]; then \
+        echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum -c -; \
+    fi; \
+    unzip -q /tmp/ghidra.zip -d /opt; \
+    mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC "$GHIDRA_HOME"; \
+    rm -f /tmp/ghidra.zip; \
+    test -x "$GHIDRA_HOME/support/analyzeHeadless"
+
+WORKDIR /work
+COPY . /work
+
+ENTRYPOINT ["python3", "-m"]
+CMD ["pipeline.report", "--pick"]

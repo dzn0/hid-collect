@@ -7,19 +7,31 @@ line, and later one or more *provenance* lines once origin is known. Nothing is
 executed — binaries are parsed purely as bytes (no disassembly, no emulation).
 
 The index has ONE job: decide, from bytes alone, which drivers are worth pulling
-into a disassembler / decompiler. It is a triage filter, not an archive — so each
-analysis line is deliberately lean: just enough identity to recognise a binary,
-plus the signals that answer the project's question, and nothing that belongs in
-the decompiler instead (no raw import table, no string dumps, no section maps).
+into a disassembler / decompiler for the project's target profile (see README).
+It is a triage filter, not an archive — each analysis line is deliberately lean:
+just enough identity to recognise a binary, the signals that answer the question,
+and nothing that belongs in the decompiler (no raw import table, no string dumps,
+no section maps).
 
-The question, stated precisely. We hunt a driver that:
-  1. exposes a **user-mode control interface** — a device + symbolic link user
-     mode can open and drive with IOCTLs;
-  2. is **not a virtual HID device** — it does NOT present synthetic input the
-     legitimate way (Virtual HID Framework / HID minidriver); and
-  3. **injects mouse/keyboard input by driving the class stack directly** —
-     calling MouseClassServiceCallback (or attaching to \\Device\\PointerClass0)
-     with crafted MOUSE_INPUT_DATA, bypassing the real HID stack.
+The target profile, in byte-reachable form. We hunt a driver that:
+  1. is a **Windows x64 kernel driver with an embedded Authenticode blob**
+     (signature validity and OS/HVCI loading eligibility are confirmed later);
+  2. exposes a **user-mode control interface** — a named device + symbolic link
+     user mode can open and drive with IOCTLs;
+  3. requests **arbitrary mouse movement specifically** — direct mouse-stack
+     injection via MouseClassServiceCallback / \\Device\\PointerClass* / crafted
+     MOUSE_INPUT_DATA. A keyboard-only direct path does NOT qualify.
+  4. does **not create or depend on its own HID device** — no Virtual HID
+     Framework use, no HID minidriver registration, no linkage against
+     hidclass/hidparse/vhf. Confirmed self-created HID is disqualifying.
+  5. is **hardware-independent at init** — approximated by creation of the user
+     control device (IoCreateDevice + IoCreateSymbolicLink) without any HID
+     binding, i.e. the control surface appears without a PnP-attached peripheral.
+
+The byte-level view cannot establish signature validity, HVCI/blocklist loading,
+effective ACLs, or that a particular call path actually moves the cursor; those
+belong to the downstream dynamic validation step. The index records what the
+bytes support and labels the rest unverified.
 
 Each analysis line is a JSON object keyed by `sha256`:
 
@@ -28,10 +40,13 @@ Each analysis line is a JSON object keyed by `sha256`:
     CodeView PDB path, and a few VS_VERSIONINFO fields (company/product/…)
   * **capabilities** — curated kernel-primitive buckets (phys_mem, port_io,
     msr_control_reg, process_access, device_io, input_injection)
-  * **hid_input** — the triage verdict: the three booleans above
-    (`user_mode_interface`, `virtual_hid`, `direct_injection`), a `verdict`
-    (`match`/`candidate`/`virtual_hid`/`none`) + `rank`, and the `evidence`
-    (which imports/strings/symlinks/GUIDs fired) so the call is auditable
+  * **hid_input** — the triage verdict for the target profile: axes
+    `mouse_injection`, `keyboard_injection`, `user_mode_interface`,
+    `self_hid_device`, `hardware_independent_init`, `x64_driver`,
+    `signature_present`; a `verdict`
+    (`match`/`candidate`/`keyboard_only`/`self_hid`/`none`) + `rank`; the
+    `evidence` so the call is auditable; and legacy aliases
+    `direct_injection` / `virtual_hid` for back-compat with older queries.
   * **loldrivers** — cross-reference against a vendored LOLDrivers snapshot
 
 A reader folds every line sharing a `sha256` (see `fold_index`). This module also
@@ -96,36 +111,42 @@ _CAPABILITIES = {
                   "iogetdeviceobjectpointer", "obreferenceobjectbyname",
                   "iocreatedevicesecure", "wdmlibiocreatedevicesecure"},
 }
-# ── the three triage axes (byte-only) ────────────────────────────────────────
+# ── the triage axes (byte-only) ──────────────────────────────────────────────
 #
-# (3) DIRECT INJECTION — driving the input class stack directly. The class
-# service callbacks are the smoking gun: a driver either imports them, or (more
-# often, to dodge trivial import scans) resolves them by name at runtime via
+# MOUSE INJECTION — driving the mouse class stack directly. The service
+# callbacks are the smoking gun: a driver either imports them, or (more often,
+# to dodge trivial import scans) resolves them by name at runtime via
 # MmGetSystemRoutineAddress, so the name survives as a string too.
-_INJECT_IMPORTS = {
+# Separately tracked from the keyboard side because the target profile requires
+# arbitrary MOUSE movement; a keyboard-only direct path does not qualify.
+_MOUSE_INJECT_IMPORTS = {"mouseclassservicecallback", "mouclassservicecallback"}
+_MOUSE_INJECT_STRINGS = {
     "mouseclassservicecallback", "mouclassservicecallback",
-    "keyboardclassservicecallback", "kbdclassservicecallback",
+    "mouse_input_data",
+    "\\driver\\mouclass", "\\driver\\mouhid",
 }
-_INJECT_STRINGS = {
-    "mouseclassservicecallback", "mouclassservicecallback",
+_MOUSE_CLASS_DEVICE_STRINGS = {"\\device\\pointerclass"}
+
+_KBD_INJECT_IMPORTS = {"keyboardclassservicecallback", "kbdclassservicecallback"}
+_KBD_INJECT_STRINGS = {
     "keyboardclassservicecallback", "kbdclassservicecallback",
-    "mouse_input_data", "keyboard_input_data",
-    "\\driver\\mouclass", "\\driver\\kbdclass",
-    "\\driver\\mouhid", "\\driver\\kbdhid",
+    "keyboard_input_data",
+    "\\driver\\kbdclass", "\\driver\\kbdhid",
 }
-# class device objects an injector attaches to / targets directly
-_CLASS_DEVICE_STRINGS = {"\\device\\pointerclass", "\\device\\keyboardclass"}
+_KBD_CLASS_DEVICE_STRINGS = {"\\device\\keyboardclass"}
+
 # the attach-to-class-stack primitive (alternative to calling the callback)
 _ATTACH_IMPORTS = {"iogetdeviceobjectpointer", "ioattachdevicetodevicestack"}
 
-# (1) USER-MODE INTERFACE — a device plus a symbolic link user mode can open.
+# USER-MODE INTERFACE — a device plus a symbolic link user mode can open.
 _CREATE_DEVICE_IMPORTS = {"iocreatedevice", "iocreatedevicesecure",
                           "wdmlibiocreatedevicesecure"}
 _SYMLINK_IMPORT = "iocreatesymboliclink"
 
-# (2) VIRTUAL HID — the *legitimate* way to present synthetic input. Its presence
-# disqualifies a driver as the abuse primitive we hunt (it is doing it the right
-# way). VHF = Virtual HID Framework; a HID minidriver links hidclass/hidparse.
+# SELF-CREATED HID DEVICE — virtual or minidriver. Disqualifying under the
+# target profile: a driver that stands up its own HID endpoint is doing the
+# legitimate thing, not the mouse-stack injection pattern we hunt. VHF = Virtual
+# HID Framework; a HID minidriver links hidclass/hidparse.
 _VHF_IMPORTS = {"vhfcreate", "vhfstart", "vhfreadreportsubmit", "vhfdeletedevice",
                 "vhfasleep", "vhfresume"}
 _HID_MINIDRIVER_IMPORTS = {"hidregisterminidriver"}
@@ -552,65 +573,112 @@ def extract_strings(data: bytes, min_len: int = 5) -> list[str]:
 
 def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
                       strings_low: list[str], guids: set[str],
-                      symlinks: list[str], device_names: list[str]) -> dict:
-    """Score the three triage axes and return a verdict + auditable evidence.
+                      symlinks: list[str], device_names: list[str],
+                      *, arch: str | None = None, is_driver: bool = False,
+                      signed: bool = False) -> dict:
+    """Score the target-profile axes and return a verdict + auditable evidence.
 
-    The target is a driver that injects input by driving the class stack directly
-    (axis 3) AND is reachable from user mode (axis 1) AND is NOT a virtual HID
-    device (axis 2 — the legitimate path, which disqualifies)."""
+    The target is a Windows x64 kernel driver with an embedded Authenticode blob
+    that exposes a user-mode control interface for ARBITRARY MOUSE movement by
+    driving the mouse class stack directly, without creating or depending on its
+    own HID device. Keyboard-only direct injection does NOT qualify. Signature
+    validity, HVCI/blocklist loading, effective ACLs, and that a call actually
+    moves the cursor are confirmed downstream; the bytes only tell us whether a
+    binary is worth looking at."""
     joined = "\n".join(strings_low)
 
-    # (3) direct input-stack injection
-    inj_imports   = sorted(imports_flat & _INJECT_IMPORTS)
-    inj_strings   = sorted(s for s in _INJECT_STRINGS if s in joined)
-    class_targets = sorted(s for s in _CLASS_DEVICE_STRINGS if s in joined)
-    class_attach  = _ATTACH_IMPORTS.issubset(imports_flat) and bool(class_targets)
-    direct_injection = bool(inj_imports or inj_strings or class_attach)
+    # ── mouse-side direct injection ────────────────────────────────────────
+    mouse_inj_imports = sorted(imports_flat & _MOUSE_INJECT_IMPORTS)
+    mouse_inj_strings = sorted(s for s in _MOUSE_INJECT_STRINGS if s in joined)
+    mouse_targets     = sorted(s for s in _MOUSE_CLASS_DEVICE_STRINGS if s in joined)
+    mouse_attach      = _ATTACH_IMPORTS.issubset(imports_flat) and bool(mouse_targets)
+    mouse_injection   = bool(mouse_inj_imports or mouse_inj_strings or mouse_attach)
 
-    # (1) user-mode control interface (device + openable symbolic link)
+    # ── keyboard-side direct injection (tracked, but disqualifying on its own)
+    kbd_inj_imports = sorted(imports_flat & _KBD_INJECT_IMPORTS)
+    kbd_inj_strings = sorted(s for s in _KBD_INJECT_STRINGS if s in joined)
+    kbd_targets     = sorted(s for s in _KBD_CLASS_DEVICE_STRINGS if s in joined)
+    kbd_attach      = _ATTACH_IMPORTS.issubset(imports_flat) and bool(kbd_targets)
+    keyboard_injection = bool(kbd_inj_imports or kbd_inj_strings or kbd_attach)
+
+    direct_injection = mouse_injection or keyboard_injection  # legacy alias
+
+    # ── user-mode control interface (device + openable symbolic link) ──────
     creates_device = bool(imports_flat & _CREATE_DEVICE_IMPORTS) and \
         _SYMLINK_IMPORT in imports_flat
     user_mode_interface = creates_device or bool(symlinks)
 
-    # (2) virtual HID device — the legitimate path; disqualifies as our target
+    # ── self-created HID device (disqualifying) ────────────────────────────
     vhf = sorted(imports_flat & _VHF_IMPORTS)
     hid_minidriver = bool(imports_flat & _HID_MINIDRIVER_IMPORTS) or \
         bool(imported_dlls & _HID_CLASS_DLLS)
-    virtual_hid = bool(vhf or hid_minidriver)
+    self_hid_device = bool(vhf or hid_minidriver)
+
+    # ── hardware-independent initialization (byte approximation) ───────────
+    # Control device appears from DriverEntry-style creation, with no HID
+    # minidriver / VHF binding. Does not prove the control surface is reachable
+    # without a PnP peripheral — only that the bytes do not depend on one.
+    hardware_independent_init = creates_device and not self_hid_device
 
     guid_hits = sorted({_HID_CLASS_GUIDS[g] for g in guids if g in _HID_CLASS_GUIDS})
-    input_adjacent = bool(class_targets or guid_hits or any(
+    input_adjacent = bool(mouse_targets or kbd_targets or guid_hits or any(
         t in joined for t in ("mouclass", "kbdclass", "pointerclass", "keyboardclass")))
 
-    if direct_injection and not virtual_hid and user_mode_interface:
-        verdict = "match"          # the full primitive — decompile this
-    elif direct_injection and not virtual_hid:
-        verdict = "candidate"      # injects directly, interface unconfirmed
-    elif virtual_hid:
-        verdict = "virtual_hid"    # legitimate synthetic-input path — filter out
+    # ── gating facts the verdict folds in ──────────────────────────────────
+    x64_driver = (arch == "x64") and is_driver
+    signature_present = bool(signed)
+
+    # ── verdict ────────────────────────────────────────────────────────────
+    if self_hid_device:
+        verdict = "self_hid"
+    elif (mouse_injection and user_mode_interface and
+          x64_driver and signature_present):
+        verdict = "match"             # full target profile reachable from bytes
+    elif mouse_injection:
+        verdict = "candidate"         # mouse-stack injection present; gating gap
+    elif keyboard_injection:
+        verdict = "keyboard_only"     # direct injection but wrong device class
     elif user_mode_interface and input_adjacent:
-        verdict = "candidate"      # user-mode device touching the input class
+        verdict = "candidate"         # user-mode device touching the input class
     else:
         verdict = "none"
-    rank = {"match": 3, "candidate": 2, "virtual_hid": 1, "none": 0}[verdict]
+    rank = {"match": 4, "candidate": 3, "keyboard_only": 2,
+            "self_hid": 1, "none": 0}[verdict]
 
     return {
         "verdict": verdict,
         "rank": rank,
-        "direct_injection": direct_injection,
+        # target-profile axes
+        "mouse_injection": mouse_injection,
+        "keyboard_injection": keyboard_injection,
         "user_mode_interface": user_mode_interface,
-        "virtual_hid": virtual_hid,
+        "self_hid_device": self_hid_device,
+        "hardware_independent_init": hardware_independent_init,
+        "x64_driver": x64_driver,
+        "signature_present": signature_present,
+        # legacy aliases — older queries still read these
+        "direct_injection": direct_injection,
+        "virtual_hid": self_hid_device,
         "evidence": {
-            "injection_imports": inj_imports,
-            "injection_strings": inj_strings,
-            "class_stack_attach": class_attach,
-            "class_device_targets": class_targets,
+            "mouse_injection_imports": mouse_inj_imports,
+            "mouse_injection_strings": mouse_inj_strings,
+            "mouse_class_targets": mouse_targets,
+            "mouse_class_attach": mouse_attach,
+            "keyboard_injection_imports": kbd_inj_imports,
+            "keyboard_injection_strings": kbd_inj_strings,
+            "keyboard_class_targets": kbd_targets,
+            "keyboard_class_attach": kbd_attach,
             "creates_user_device": creates_device,
             "symlinks": symlinks[:12],
             "device_names": device_names[:8],
             "vhf_imports": vhf,
             "hid_minidriver": hid_minidriver,
             "class_guids": guid_hits,
+            # legacy aliases — unions of the per-side lists
+            "injection_imports": sorted(set(mouse_inj_imports) | set(kbd_inj_imports)),
+            "injection_strings": sorted(set(mouse_inj_strings) | set(kbd_inj_strings)),
+            "class_device_targets": sorted(set(mouse_targets) | set(kbd_targets)),
+            "class_stack_attach": mouse_attach or kbd_attach,
         },
     }
 
@@ -710,8 +778,12 @@ def analyze_binary(path: Path, *, min_str: int = 5) -> dict:
     else:
         entry["pe"] = None
 
+    pe_meta = entry.get("pe") if isinstance(entry.get("pe"), dict) else {}
     entry["hid_input"] = hid_input_signals(
-        imports_flat, imported_dlls, strs_low, guids, symlinks, device_names)
+        imports_flat, imported_dlls, strs_low, guids, symlinks, device_names,
+        arch=pe_meta.get("arch"),
+        is_driver=bool(pe_meta.get("is_driver")),
+        signed=bool(pe_meta.get("signed")))
     entry["loldrivers"] = loldrivers_match(path.stem, imphash)
     return entry
 

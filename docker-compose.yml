@@ -81,3 +81,35 @@ services:
       PDT_SDI_REFRESH_DISCOVERY: ${PDT_SDI_REFRESH_DISCOVERY:-0}
     tty: true
     command: ["pipeline.collect", "snappy-driver"]
+
+  # ---- analysis image: Ghidra headless + the pipeline -------------------
+  # Builds reports/<sha256>/ from a triaged binary already in the store.
+  #   docker compose build ghidra
+  #   docker compose run --rm report --pick            # best target + why
+  #   docker compose run --rm report <sha-or-prefix>   # build the report
+  ghidra:
+    image: hid-collect-ghidra:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.ghidra
+      args:
+        GHIDRA_VERSION: ${GHIDRA_VERSION:-12.1.4}
+        GHIDRA_RELEASE: ${GHIDRA_RELEASE:-20260921}
+        GHIDRA_SHA256: ${GHIDRA_SHA256:-ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db}
+    volumes:
+      - ./pipeline_out:/work/pipeline_out
+      - ./pipeline:/work/pipeline
+      - ./ghidra_scripts:/work/ghidra_scripts
+      - ./reports:/work/reports
+    tty: true
+    command: ["pipeline.report", "--pick"]
+
+  # Convenience alias so `docker compose run --rm report <args>` reads naturally
+  # (entrypoint is pinned to the report module, so run-args append to it):
+  #   docker compose run --rm report --pick
+  #   docker compose run --rm report 83df54c9e75b
+  report:
+    extends:
+      service: ghidra
+    entrypoint: ["python3", "-m", "pipeline.report"]
+    command: ["--pick"]

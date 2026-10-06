@@ -49,8 +49,11 @@ from . import index as _index
 
 # capability bucket names, straight from the analyzer so the two never drift
 _CAP_NAMES = sorted(_index._CAPABILITIES.keys())
-# the index's three-axis verdict space (see pipeline.index.hid_input_signals)
-_VERDICTS = ("match", "candidate", "virtual_hid", "none")
+# the index's verdict space (see pipeline.index.hid_input_signals).
+# `virtual_hid` is the legacy name for `self_hid` and still accepted so older
+# saved commands keep working against folded records that pre-date the rename.
+_VERDICTS = ("match", "candidate", "keyboard_only", "self_hid",
+             "virtual_hid", "none")
 
 
 # ----------------------------------------------------------------- extraction
@@ -134,7 +137,14 @@ _RESOLVERS: dict[str, Callable[[dict], Any]] = {
     "rank": lambda r: _hid(r).get("rank") or 0,
     "inj": lambda r: "Y" if _hid(r).get("direct_injection") else "-",
     "umi": lambda r: "Y" if _hid(r).get("user_mode_interface") else "-",
-    "vhid": lambda r: "Y" if _hid(r).get("virtual_hid") else "-",
+    "vhid": lambda r: "Y" if _hid(r).get("self_hid_device",
+                                        _hid(r).get("virtual_hid")) else "-",
+    "mouse": lambda r: "Y" if _hid(r).get("mouse_injection") else "-",
+    "kbd": lambda r: "Y" if _hid(r).get("keyboard_injection") else "-",
+    "shid": lambda r: "Y" if _hid(r).get("self_hid_device",
+                                         _hid(r).get("virtual_hid")) else "-",
+    "hwi": lambda r: "Y" if _hid(r).get("hardware_independent_init") else "-",
+    "x64": lambda r: "Y" if _hid(r).get("x64_driver") else "-",
     "lol": lambda r: "Y" if _dig(r, "loldrivers.known") else "-",
     "caps": lambda r: ",".join(_caps(r)) or "-",
     "wx": lambda r: "Y" if _has_wx(r) else "-",
@@ -201,12 +211,25 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
         preds.append(lambda r: (_hid(r).get("rank") or 0) >= a.min_rank)
     if a.direct_injection:
         preds.append(lambda r: bool(_hid(r).get("direct_injection")))
+    if a.mouse_injection:
+        preds.append(lambda r: bool(_hid(r).get("mouse_injection")))
+    if a.keyboard_injection:
+        preds.append(lambda r: bool(_hid(r).get("keyboard_injection")))
     if a.user_mode_interface:
         preds.append(lambda r: bool(_hid(r).get("user_mode_interface")))
-    if a.virtual_hid:
-        preds.append(lambda r: bool(_hid(r).get("virtual_hid")))
-    if a.no_virtual_hid:
-        preds.append(lambda r: not _hid(r).get("virtual_hid"))
+
+    def _self_hid(r: dict) -> bool:  # new field, with legacy fallback
+        h = _hid(r)
+        return bool(h.get("self_hid_device", h.get("virtual_hid")))
+
+    if a.virtual_hid or a.self_hid:
+        preds.append(_self_hid)
+    if a.no_virtual_hid or a.no_self_hid:
+        preds.append(lambda r: not _self_hid(r))
+    if a.hw_independent:
+        preds.append(lambda r: bool(_hid(r).get("hardware_independent_init")))
+    if a.x64_driver:
+        preds.append(lambda r: bool(_hid(r).get("x64_driver")))
 
     if a.signed:
         preds.append(_signed)
@@ -245,7 +268,8 @@ def _build_predicates(a: argparse.Namespace) -> list[Callable[[dict], bool]]:
 
 
 _COLOR = sys.stdout.isatty()
-_C = {"match": "\033[31m", "candidate": "\033[33m", "virtual_hid": "\033[36m",
+_C = {"match": "\033[31m", "candidate": "\033[33m",
+      "keyboard_only": "\033[2m", "self_hid": "\033[36m", "virtual_hid": "\033[36m",
       "none": "\033[2m", "lol": "\033[31m", "reset": "\033[0m", "dim": "\033[2m"}
 
 
@@ -326,15 +350,25 @@ def _print_detail(rec: dict) -> None:
     head("hid_input")
     print(f"verdict     {_paint(hid.get('verdict') or 'none', hid.get('verdict') or 'none')}"
           f"  rank {hid.get('rank')}")
-    print(f"axes        direct_injection={hid.get('direct_injection')}  "
-          f"user_mode_interface={hid.get('user_mode_interface')}  "
-          f"virtual_hid={hid.get('virtual_hid')}")
+    print(f"axes        mouse_injection={hid.get('mouse_injection')}  "
+          f"keyboard_injection={hid.get('keyboard_injection')}  "
+          f"user_mode_interface={hid.get('user_mode_interface')}")
+    print(f"            self_hid_device="
+          f"{hid.get('self_hid_device', hid.get('virtual_hid'))}  "
+          f"hardware_independent_init={hid.get('hardware_independent_init')}")
+    print(f"            x64_driver={hid.get('x64_driver')}  "
+          f"signature_present={hid.get('signature_present')}")
     if ev:
-        _ev_list("injection imports", ev.get("injection_imports"))
-        _ev_list("injection strings", ev.get("injection_strings"))
-        if ev.get("class_stack_attach"):
-            print("  class_stack_attach  yes (IoGetDeviceObjectPointer + attach)")
-        _ev_list("class device targets", ev.get("class_device_targets"))
+        _ev_list("mouse inj imports", ev.get("mouse_injection_imports"))
+        _ev_list("mouse inj strings", ev.get("mouse_injection_strings"))
+        _ev_list("mouse class targets", ev.get("mouse_class_targets"))
+        if ev.get("mouse_class_attach"):
+            print("  mouse_class_attach  yes (IoGetDeviceObjectPointer + attach)")
+        _ev_list("kbd inj imports", ev.get("keyboard_injection_imports"))
+        _ev_list("kbd inj strings", ev.get("keyboard_injection_strings"))
+        _ev_list("kbd class targets", ev.get("keyboard_class_targets"))
+        if ev.get("keyboard_class_attach"):
+            print("  kbd_class_attach    yes (IoGetDeviceObjectPointer + attach)")
         if ev.get("creates_user_device"):
             print("  creates_user_device yes (IoCreateDevice + IoCreateSymbolicLink)")
         _ev_list("symlinks", ev.get("symlinks"))
@@ -404,7 +438,9 @@ def _print_stats(records: list[dict]) -> None:
     _dist("verdicts", Counter((_hid(r).get("verdict") or "none") for r in records))
     _dist("axes true", Counter(
         axis for r in records for axis in
-        ("direct_injection", "user_mode_interface", "virtual_hid")
+        ("mouse_injection", "keyboard_injection", "user_mode_interface",
+         "self_hid_device", "hardware_independent_init",
+         "x64_driver", "signature_present")
         if _hid(r).get(axis)))
     _dist("arch", Counter((_pe(r).get("arch") or "-") for r in records))
     cap_counter: Counter = Counter()
@@ -457,15 +493,31 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--verdict", action="append", choices=list(_VERDICTS),
                    metavar="VERDICT", help="match/candidate/virtual_hid/none (repeatable)")
     f.add_argument("--min-rank", type=int, metavar="N", dest="min_rank",
-                   help="hid_input.rank >= N (match=3, candidate=2, virtual_hid=1, none=0)")
+                   help="hid_input.rank >= N "
+                        "(match=4, candidate=3, keyboard_only=2, self_hid=1, none=0)")
     f.add_argument("--direct-injection", action="store_true", dest="direct_injection",
-                   help="drives the input class stack directly (axis 3)")
+                   help="drives any input class stack directly (legacy; mouse OR keyboard)")
+    f.add_argument("--mouse-injection", action="store_true", dest="mouse_injection",
+                   help="drives the MOUSE class stack directly (required by target profile)")
+    f.add_argument("--keyboard-injection", action="store_true", dest="keyboard_injection",
+                   help="drives the keyboard class stack directly "
+                        "(disqualifying on its own under the target profile)")
     f.add_argument("--user-mode-interface", action="store_true", dest="user_mode_interface",
-                   help="exposes a user-mode control interface (axis 1)")
+                   help="exposes a user-mode control interface (device + symlink)")
+    f.add_argument("--self-hid", action="store_true", dest="self_hid",
+                   help="creates or depends on its own HID device "
+                        "(VHF / HID minidriver / hidclass/hidparse/vhf linkage) — disqualifies")
+    f.add_argument("--no-self-hid", action="store_true", dest="no_self_hid",
+                   help="is NOT a self-created HID device")
     f.add_argument("--virtual-hid", action="store_true", dest="virtual_hid",
-                   help="is a virtual HID device (axis 2 — disqualifies as target)")
+                   help="legacy alias of --self-hid")
     f.add_argument("--no-virtual-hid", action="store_true", dest="no_virtual_hid",
-                   help="is NOT a virtual HID device")
+                   help="legacy alias of --no-self-hid")
+    f.add_argument("--hw-independent", action="store_true", dest="hw_independent",
+                   help="control device appears without HID binding "
+                        "(byte approximation of hardware-independent init)")
+    f.add_argument("--x64-driver", action="store_true", dest="x64_driver",
+                   help="PE is an x64 kernel driver (target profile prerequisite)")
 
     f.add_argument("--signed", action="store_true", help="has embedded Authenticode")
     f.add_argument("--unsigned", action="store_true", help="no embedded Authenticode")
