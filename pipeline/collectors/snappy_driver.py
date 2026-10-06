@@ -4,14 +4,16 @@ SDIO publishes the entire Windows driver corpus as a single torrent of ~410
 files: per-category driverpacks (`drivers/DP_*.7z`) plus small index blobs.
 It is the one community source with scale comparable to the Microsoft Update
 Catalog and, being BitTorrent, is immune to the HTTP rate-limiting that blocks
-the web archives. Mice and keyboards there use the in-box HID stack, so every
-pointing-device driver that ships a real `.sys` lives under `DP_Touchpad_*`:
+the web archives. There is no DP_Mouse / DP_Keyboard pack — those devices ride
+the in-box HID stack — so the input drivers that ship a real `.sys` are the five
+touchpad packs plus the generic HID pack (default categories "touchpad,hid"):
 
     drivers/DP_Touchpad_Alps_*.7z
     drivers/DP_Touchpad_Cypress_*.7z
     drivers/DP_Touchpad_Elan_*.7z
     drivers/DP_Touchpad_Others_*.7z
     drivers/DP_Touchpad_Synaptics_*.7z
+    drivers/DP_HID_*.7z            (generic Human Interface Devices)
 
 Flow:
 
@@ -32,7 +34,7 @@ as the other collectors; `drivers/<sha256>.sys` dedupes across all sources.
 
 Environment knobs:
 - `PDT_SDI_TORRENT`      (url)     default: glenn.delahoy.com SDIO_Update.torrent
-- `PDT_SDI_CATEGORIES`   (csv)     default: "touchpad" (which DP_* families)
+- `PDT_SDI_CATEGORIES`   (csv)     default: "touchpad,hid" (which DP_* families)
 - `PDT_SDI_ARIA2`        (path)    default: "aria2c"
 - `PDT_SDI_BT_TIMEOUT`   (int s)   default: 300 (abort a stalled swarm)
 - `PDT_SDI_MAX_PACKS`    (int)     default: 0 (unlimited)
@@ -111,7 +113,7 @@ class SnappyDriverCollector(Collector):
 
     def __init__(self) -> None:
         self.torrent_url = os.environ.get("PDT_SDI_TORRENT", DEFAULT_TORRENT)
-        raw = os.environ.get("PDT_SDI_CATEGORIES", "touchpad")
+        raw = os.environ.get("PDT_SDI_CATEGORIES", "touchpad,hid")
         self.categories = [c.strip().lower() for c in raw.split(",") if c.strip()]
         self.aria2 = os.environ.get("PDT_SDI_ARIA2", "aria2c")
         self.bt_timeout = _env_int("PDT_SDI_BT_TIMEOUT", 300)
