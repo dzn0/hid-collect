@@ -3,6 +3,13 @@
 #   docker compose build
 #   docker compose run --rm collect           # list collectors
 #   docker compose run --rm msupdate-catalog  # sweep the MS Update Catalog (primary, WHQL)
+#   docker compose run --rm vendor-catalog    # sweep the Dell/HP OEM driver catalogs
+#
+# Tune vendor-catalog (see pipeline/collectors/vendor_catalog.py):
+#   PDT_VC_SOURCES=dell,hp                     (which OEM catalogs to crawl)
+#   PDT_VC_JOBS=8 / PDT_VC_MAX_PACKS=0         (download workers; 0 = unlimited)
+#   PDT_VC_MAX_MB=300                          (per-package size cap)
+#   PDT_VC_REFRESH=1 / PDT_VC_REFRESH_DISCOVERY=1
 #
 # Tune msupdate-catalog (see pipeline/collectors/msupdate_catalog.py):
 #   PDT_MSC_QUERIES="mouse;keyboard;..."      (; separated; default curated HID bank)
@@ -41,3 +48,16 @@ services:
       PDT_MSC_DISCOVERY_TTL_DAYS: ${PDT_MSC_DISCOVERY_TTL_DAYS:-7}
     tty: true
     command: ["pipeline.collect", "msupdate-catalog"]
+
+  vendor-catalog:
+    <<: *hc-common
+    environment:
+      PDT_VC_SOURCES: ${PDT_VC_SOURCES:-dell,hp}
+      PDT_VC_JOBS: ${PDT_VC_JOBS:-8}
+      PDT_VC_MAX_PACKS: ${PDT_VC_MAX_PACKS:-0}
+      PDT_VC_MAX_MB: ${PDT_VC_MAX_MB:-300}
+      PDT_VC_REFRESH: ${PDT_VC_REFRESH:-0}
+      PDT_VC_REFRESH_DISCOVERY: ${PDT_VC_REFRESH_DISCOVERY:-0}
+      PDT_VC_DISCOVERY_TTL_DAYS: ${PDT_VC_DISCOVERY_TTL_DAYS:-7}
+    tty: true
+    command: ["pipeline.collect", "vendor-catalog"]
