@@ -6,6 +6,7 @@ properties the community archives (DriverGuide, Softpedia, DriverScape) lacked �
 no rate limiting on a sustained single-IP sweep, and real kernel `.sys` inside:
   * msupdate-catalog — the Microsoft Update Catalog (WHQL-signed; Playwright).
   * vendor-catalog   — Dell + HP OEM driver catalogs (plain XML, direct CDNs).
+  * snappy-driver    — Snappy Driver Installer input driverpacks (BitTorrent).
 """
 from __future__ import annotations
 from typing import Callable
@@ -13,11 +14,13 @@ from typing import Callable
 from .base import Collector
 from .msupdate_catalog import collector as _msupdate_catalog
 from .vendor_catalog import collector as _vendor_catalog
+from .snappy_driver import collector as _snappy_driver
 
 
 REGISTRY: dict[str, Callable[[], Collector]] = {
     "msupdate-catalog": _msupdate_catalog,
     "vendor-catalog": _vendor_catalog,
+    "snappy-driver": _snappy_driver,
 }
 
 

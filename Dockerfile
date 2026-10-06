@@ -9,15 +9,16 @@
 #   docker compose run --rm msupdate-catalog
 #
 # Mostly stdlib Python. Runtime deps: 7-Zip (archive + installer extraction),
-# curl + curl_cffi (streaming downloads), and Playwright/Chromium — the catalog
-# paginates via an ASP.NET postback that stdlib urllib cannot follow, so
-# discovery always drives a real headless browser.
+# curl + curl_cffi (streaming downloads), aria2 (BitTorrent client for the
+# snappy-driver collector — installed here, never expected on the host), and
+# Playwright/Chromium — the MS catalog paginates via an ASP.NET postback that
+# stdlib urllib cannot follow, so discovery always drives a real headless browser.
 
 FROM python:3.13-slim-bookworm
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        p7zip-full curl ca-certificates \
+        p7zip-full curl ca-certificates aria2 \
  && rm -rf /var/lib/apt/lists/*
 
 # curl_cffi: TLS/JA3 impersonation for streaming downloads. Ships a prebuilt

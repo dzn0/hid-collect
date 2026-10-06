@@ -4,12 +4,20 @@
 #   docker compose run --rm collect           # list collectors
 #   docker compose run --rm msupdate-catalog  # sweep the MS Update Catalog (primary, WHQL)
 #   docker compose run --rm vendor-catalog    # sweep the Dell/HP OEM driver catalogs
+#   docker compose run --rm snappy-driver     # fetch SDI input driverpacks via torrent
 #
 # Tune vendor-catalog (see pipeline/collectors/vendor_catalog.py):
 #   PDT_VC_SOURCES=dell,hp                     (which OEM catalogs to crawl)
 #   PDT_VC_JOBS=8 / PDT_VC_MAX_PACKS=0         (download workers; 0 = unlimited)
 #   PDT_VC_MAX_MB=300                          (per-package size cap)
 #   PDT_VC_REFRESH=1 / PDT_VC_REFRESH_DISCOVERY=1
+#
+# Tune snappy-driver (see pipeline/collectors/snappy_driver.py; aria2 torrent,
+# Docker-only):
+#   PDT_SDI_CATEGORIES=touchpad                (DP_* families to select)
+#   PDT_SDI_BT_TIMEOUT=300                     (abort a stalled swarm, seconds)
+#   PDT_SDI_MAX_PACKS=0                        (0 = all selected packs)
+#   PDT_SDI_REFRESH=1 / PDT_SDI_REFRESH_DISCOVERY=1
 #
 # Tune msupdate-catalog (see pipeline/collectors/msupdate_catalog.py):
 #   PDT_MSC_QUERIES="mouse;keyboard;..."      (; separated; default curated HID bank)
@@ -61,3 +69,15 @@ services:
       PDT_VC_DISCOVERY_TTL_DAYS: ${PDT_VC_DISCOVERY_TTL_DAYS:-7}
     tty: true
     command: ["pipeline.collect", "vendor-catalog"]
+
+  snappy-driver:
+    <<: *hc-common
+    environment:
+      PDT_SDI_CATEGORIES: ${PDT_SDI_CATEGORIES:-touchpad}
+      PDT_SDI_BT_TIMEOUT: ${PDT_SDI_BT_TIMEOUT:-300}
+      PDT_SDI_SEED_TIME: ${PDT_SDI_SEED_TIME:-0}
+      PDT_SDI_MAX_PACKS: ${PDT_SDI_MAX_PACKS:-0}
+      PDT_SDI_REFRESH: ${PDT_SDI_REFRESH:-0}
+      PDT_SDI_REFRESH_DISCOVERY: ${PDT_SDI_REFRESH_DISCOVERY:-0}
+    tty: true
+    command: ["pipeline.collect", "snappy-driver"]
