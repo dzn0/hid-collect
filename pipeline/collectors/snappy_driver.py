@@ -234,17 +234,20 @@ class SnappyDriverCollector(Collector):
 
     def _aria2_download(self, dl_root: Path) -> None:
         indices = ",".join(str(t["index"]) for t in self._targets)
+        # NB: aria2 boolean/value options MUST use the --opt=value form. The
+        # space-separated form (--enable-dht true) makes aria2 treat "true" as a
+        # download URI and abort ("Unrecognized URI or unsupported protocol").
         cmd = [
             self.aria2,
-            "--dir", str(dl_root),
-            "--select-file", indices,
-            "--seed-time", str(self.seed_time),
-            "--bt-stop-timeout", str(self.bt_timeout),
-            "--summary-interval", "10",
-            "--console-log-level", "warn",
-            "--enable-dht", "true",
-            "--bt-enable-lpd", "true",
-            "--check-integrity", "true",
+            f"--dir={dl_root}",
+            f"--select-file={indices}",
+            f"--seed-time={self.seed_time}",
+            f"--bt-stop-timeout={self.bt_timeout}",
+            "--summary-interval=10",
+            "--console-log-level=warn",
+            "--enable-dht=true",
+            "--bt-enable-lpd=true",
+            "--check-integrity=true",
             str(self._torrent_path),
         ]
         progress.report(
