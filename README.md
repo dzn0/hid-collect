@@ -6,10 +6,18 @@
 
 <p align="center">
   <a href="#what-makes-it-different">What makes it different</a> &middot;
+  <a href="#findings">Findings</a> &middot;
   <a href="#how-it-works">How it works</a> &middot;
   <a href="#quickstart">Quickstart</a> &middot;
-  <a href="#the-corpus">The corpus</a> &middot;
   <a href="AGENTS.md">AGENTS.md &rarr;</a>
+</p>
+
+<p align="center">
+  <strong>Already surfaced a real finding:</strong>
+  <a href="https://github.com/dzn0/vhidev-hid-takeover"><code>dzn0/vhidev-hid-takeover</code></a>
+  &mdash; a signed Microsoft WHQL driver that lets any admin-installed, non-privileged
+  process puppet the full Windows HID input stack (keyboard, mouse, media, power).
+  Found by this pipeline. PoC in its own repo.
 </p>
 
 ---
@@ -33,6 +41,32 @@ and `unknown` as a first-class answer.
 If you're a human reading this, run the collectors below and poke around. If
 you're an LLM reading this, open [`AGENTS.md`](AGENTS.md). That is your
 bootstrap.
+
+## Findings
+
+The pipeline is not just a design exercise — it has already produced a public,
+reproducible finding under its own six-criterion profile:
+
+### [`vhidev.sys` / `vhidflt.sys`](https://github.com/dzn0/vhidev-hid-takeover) &mdash; CONFIRMED
+
+A WHQL-signed Microsoft driver (*Virtual HID Provider — HIDClass — 18.13.46.429*,
+sha256 `c8819dbd...414de9f5c`) that creates its own HID keyboard + mouse + consumer
++ system-control collections and exposes a user-mode-reachable vendor interface.
+Any admin-installed process can then puppet the full Windows HID input stack
+(keyboard, mouse, media, power) through a single `WriteFile` on that interface —
+input flows through the normal HID path and is indistinguishable from a real USB
+device to the OS, applications, and anti-cheat engines.
+
+Validated end-to-end on Windows 11 build 26300 with **Secure Boot + HVCI + VBS
+all ON**, no protections disabled, no test-signing, no binary patching. All six
+criteria met.
+
+- **Standalone PoC + write-up:** [`dzn0/vhidev-hid-takeover`](https://github.com/dzn0/vhidev-hid-takeover)
+- **Full report folder** (static + dynamic + per-criterion verdict): `reports/c8819dbd...414de9f5c/`
+
+The pipeline is designed to produce more of these as the agent works through
+the shortlist. Each confirmed target gets its own `reports/<sha256>/result.md`,
+and the strongest ones can graduate to standalone PoC repos the same way.
 
 ## What it does
 
@@ -300,12 +334,14 @@ Each confirmed-or-rejected target lands in `reports/<sha256>/result.md`.
 Scope limits are recorded alongside the verdict (which Windows builds were
 tested, which access modes measured, which capabilities exercised).
 
-Current public result:
+Current public results:
 
-- **`c8819dbd...414de9f5c`** — `vhidev.sys` / `vhidflt.sys` (Virtual HID
-  Provider, 18.13.46.429) &mdash; **CONFIRMED** on Windows 11 build 26300
-  under Secure Boot + HVCI + VBS. All six criteria established; details
-  under `reports/`.
+| sha256 | driver | verdict | writeup |
+|---|---|---|---|
+| `c8819dbd...414de9f5c` | `vhidev.sys` / `vhidflt.sys` (Virtual HID Provider 18.13.46.429) | **CONFIRMED** on Windows 11 build 26300 under Secure Boot + HVCI + VBS; all six criteria met | [`dzn0/vhidev-hid-takeover`](https://github.com/dzn0/vhidev-hid-takeover) |
+
+See [Findings](#findings) above for the short version of this result and why
+it matters.
 
 ## For AI agents
 
