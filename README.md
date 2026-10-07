@@ -159,6 +159,6 @@ Rejected after investigation:
 
 Load [`AGENTS.md`](AGENTS.md) before anything else. It is dense on purpose. Every clause there is a precondition for valid output; this README is advertising.
 
-## License
+## License & Disclaimer
 
-See `LICENSE`.
+[MIT](LICENSE). Provided for **authorized security research and educational purposes only**. The author is not responsible for any misuse. Collection is static and containerised; dynamic validation lives in isolated VMs. Always obtain proper authorization before testing on any system you do not own.
