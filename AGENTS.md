@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Operating spec for AI agents running in a `hid-collect` checkout. This file
+Operating spec for AI agents running in a `hid-driver-triage` checkout. This file
 is your bootstrap. The repo is designed to be driven by LLM agents; `README.md`
 advertises that externally. Treat every clause here as a precondition for valid
 output.

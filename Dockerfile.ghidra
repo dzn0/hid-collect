@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# hid-collect — analysis image: Ghidra headless + the pipeline, for turning a
+# hid-driver-triage — analysis image: Ghidra headless + the pipeline, for turning a
 # triaged binary in the store into a per-driver report folder under reports/.
 #
 #   docker compose build ghidra

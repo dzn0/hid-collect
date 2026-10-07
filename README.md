@@ -1,4 +1,4 @@
-<h1 align="center">hid-collect</h1>
+<h1 align="center">hid-driver-triage</h1>
 
 <p align="center">
   <strong>An LLM-operated research pipeline for finding Windows HID drivers that provide user-mode-reachable input injection.</strong>
@@ -27,7 +27,7 @@
 **This project is designed to be driven by an LLM agent, not a human reviewer.**
 
 Most driver-research tooling expects a human to pick candidates, read decompiles,
-run the dynamic tests, and write up findings. `hid-collect` instead ships a
+run the dynamic tests, and write up findings. `hid-driver-triage` instead ships a
 machine-oriented operating spec — [`AGENTS.md`](AGENTS.md) — that an AI agent
 loads on first turn and executes top-to-bottom: pick, confirm with the user,
 build the report, read the Ghidra output, grow a per-report dynamic script step
@@ -224,7 +224,7 @@ previous scoring profile and are kept as a historical reference.
 ## Project structure
 
 ```
-hid-collect/
+hid-driver-triage/
   AGENTS.md                     # <-- the LLM operating spec (start here)
   README.md                     # this file
   docker-compose.yml

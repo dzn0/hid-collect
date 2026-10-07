@@ -28,7 +28,7 @@ desktop.ini
 # another install if you want to resume.
 pipeline_out/
 
-# Legacy artifacts from the parent repo layout. Not produced by hid-collect,
+# Legacy artifacts from the parent repo layout. Not produced by hid-driver-triage,
 # but ignored defensively so a stray copy from hid-driver-triage never gets
 # committed by mistake.
 reports/

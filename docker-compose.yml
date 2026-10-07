@@ -1,4 +1,4 @@
-# hid-collect — minimal collector image.
+# hid-driver-triage — minimal collector image.
 #
 #   docker compose build
 #   docker compose run --rm collect           # list collectors
@@ -30,7 +30,7 @@
 # ledger (processed.jsonl) and the discovery cache survive rebuilds.
 
 x-hc-common: &hc-common
-  image: hid-collect:latest
+  image: hid-driver-triage:latest
   build: .
   volumes:
     - ./pipeline_out:/work/pipeline_out
@@ -88,7 +88,7 @@ services:
   #   docker compose run --rm report --pick            # best target + why
   #   docker compose run --rm report <sha-or-prefix>   # build the report
   ghidra:
-    image: hid-collect-ghidra:latest
+    image: hid-driver-triage-ghidra:latest
     build:
       context: .
       dockerfile: Dockerfile.ghidra

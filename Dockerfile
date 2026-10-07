@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 #
-# hid-collect — stripped-down collector for Windows kernel drivers shipped with
+# hid-driver-triage — stripped-down collector for Windows kernel drivers shipped with
 # HID peripherals, pulled from the Microsoft Update Catalog (WHQL-signed). Does
 # only collection, extraction and content-addressed storage of .sys files. No
 # signature verification, no fingerprint, no scope profiles, no analyze stage.
 #
-#   docker build -t hid-collect:latest .
+#   docker build -t hid-driver-triage:latest .
 #   docker compose run --rm msupdate-catalog
 #
 # Mostly stdlib Python. Runtime deps: 7-Zip (archive + installer extraction),
