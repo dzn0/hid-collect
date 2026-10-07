@@ -5,7 +5,6 @@
 </p>
 
 <p align="center">
-  <a href="#what-makes-it-different">What makes it different</a> &middot;
   <a href="#findings">Findings</a> &middot;
   <a href="#how-it-works">How it works</a> &middot;
   <a href="#quickstart">Quickstart</a> &middot;
@@ -15,193 +14,103 @@
 <p align="center">
   <strong>Already surfaced a real finding:</strong>
   <a href="https://github.com/dzn0/vhidev-hid-takeover"><code>dzn0/vhidev-hid-takeover</code></a>
-  &mdash; a signed Microsoft WHQL driver that lets any admin-installed, non-privileged
-  process puppet the full Windows HID input stack (keyboard, mouse, media, power).
-  Found by this pipeline. PoC in its own repo.
+  &mdash; a WHQL-signed Microsoft driver that puppets the full Windows HID input stack (keyboard, mouse, media, power). Found by this pipeline. PoC in its own repo.
 </p>
 
 ---
 
-## What makes it different
+## LLM-first by design
 
 **This project is designed to be driven by an LLM agent, not a human reviewer.**
 
-Most driver-research tooling expects a human to pick candidates, read decompiles,
-run the dynamic tests, and write up findings. `hid-driver-triage` instead ships a
-machine-oriented operating spec — [`AGENTS.md`](AGENTS.md) — that an AI agent
-loads on first turn and executes top-to-bottom: pick, confirm with the user,
-build the report, read the Ghidra output, grow a per-report dynamic script step
-by step, and emit a per-criterion verdict in `result.md`.
+Most driver-research tooling expects a human to pick candidates, read decompiles, run dynamic tests, and write up findings. `hid-driver-triage` ships a machine-oriented operating spec — [`AGENTS.md`](AGENTS.md) — that an AI agent loads on first turn and executes top-to-bottom: pick, confirm with the user, build the report, read the Ghidra output, grow a per-report dynamic script step by step, and emit a per-criterion verdict in `result.md`.
 
-The pipeline, triage model, verdict schema, report folder contract, and
-dynamic-script format are all designed around what makes an agent reliable:
-explicit preconditions, enforceable rules, unambiguous verdict categories,
-and `unknown` as a first-class answer.
+The triage model, verdict schema, and dynamic-script format are all built around what makes an agent reliable: explicit preconditions, enforceable rules, unambiguous verdicts, and `unknown` as a first-class answer.
 
-If you're a human reading this, run the collectors below and poke around. If
-you're an LLM reading this, open [`AGENTS.md`](AGENTS.md). That is your
-bootstrap.
+If you're a human reading this, run the collectors below. If you're an LLM, open [`AGENTS.md`](AGENTS.md) — that is your bootstrap.
 
 ## Findings
 
-The pipeline is not just a design exercise — it has already produced a public,
-reproducible finding under its own six-criterion profile:
+The pipeline is not a design exercise. It has produced a public, reproducible finding under its own six-criterion profile:
 
-### [`vhidev.sys` / `vhidflt.sys`](https://github.com/dzn0/vhidev-hid-takeover) &mdash; CONFIRMED
+**[`vhidev.sys` / `vhidflt.sys`](https://github.com/dzn0/vhidev-hid-takeover) — CONFIRMED.** A WHQL-signed Microsoft driver (*Virtual HID Provider — HIDClass — 18.13.46.429*) that creates its own HID keyboard, mouse, consumer, and system-control collections and exposes a user-mode-reachable vendor interface. Any admin-installed process can then puppet the full Windows HID input stack through a single `WriteFile` — input flows through the normal HID path and is indistinguishable from a real USB device.
 
-A WHQL-signed Microsoft driver (*Virtual HID Provider — HIDClass — 18.13.46.429*,
-sha256 `c8819dbd...414de9f5c`) that creates its own HID keyboard + mouse + consumer
-+ system-control collections and exposes a user-mode-reachable vendor interface.
-Any admin-installed process can then puppet the full Windows HID input stack
-(keyboard, mouse, media, power) through a single `WriteFile` on that interface —
-input flows through the normal HID path and is indistinguishable from a real USB
-device to the OS, applications, and anti-cheat engines.
+Validated end-to-end on Windows 11 build 26300 with **Secure Boot + HVCI + VBS all ON**, no protections disabled, no test-signing, no binary patching. All six criteria met.
 
-Validated end-to-end on Windows 11 build 26300 with **Secure Boot + HVCI + VBS
-all ON**, no protections disabled, no test-signing, no binary patching. All six
-criteria met.
+- Standalone PoC + write-up: [`dzn0/vhidev-hid-takeover`](https://github.com/dzn0/vhidev-hid-takeover)
+- Full report folder (static + dynamic + per-criterion verdict): `reports/c8819dbd...414de9f5c/`
 
-- **Standalone PoC + write-up:** [`dzn0/vhidev-hid-takeover`](https://github.com/dzn0/vhidev-hid-takeover)
-- **Full report folder** (static + dynamic + per-criterion verdict): `reports/c8819dbd...414de9f5c/`
-
-The pipeline is designed to produce more of these as the agent works through
-the shortlist. Each confirmed target gets its own `reports/<sha256>/result.md`,
-and the strongest ones can graduate to standalone PoC repos the same way.
-
-## What it does
-
-Pulls Windows kernel drivers (`.sys`) shipped alongside HID peripherals from
-rate-limit-free archives, scores every binary **from the bytes only**, and
-deduplicates into a content-addressed store. From the shortlist, an agent
-promotes one driver at a time through static read + controlled dynamic
-validation under full Secure Boot + HVCI + driver-blocklist protections, and
-emits a confirmed/rejected result against a six-criterion profile.
-
-**Target.** A signed, Windows 10/11 x64 driver that creates its own HID mouse
-device (virtual or software-enumerated), is hardware-independent at init, and
-delivers caller-controlled mouse movement through that HID device via a
-user-mode-reachable interface.
+More findings graduate to their own PoC repos the same way.
 
 ## How it works
 
 ```
-                  +---------------------+
-                  |  AI agent reads     |
-                  |  AGENTS.md          |
-                  +----------+----------+
-                             |
-                             v
-+--------+     +-------------+-------------+     +----------------+
-| Public |---->| Collectors (containerised |---->| Content-addr.  |
-| sources|     | msupdate-catalog / vendor-|     | store + index  |
-+--------+     | catalog / snappy-driver)  |     | (bytes only)   |
-               +-------------+-------------+     +--------+-------+
-                                                          |
-                                                          v
-                                                +---------+---------+
-                                                | pipeline.query +  |
-                                                | report --pick     |
-                                                +---------+---------+
-                                                          |
-                                                          v
-                                            +-------------+-------------+
-                                            | reports/<sha256>/         |
-                                            |   <driver>.sys            |
-                                            |   <driver>.c (Ghidra)     |
-                                            |   dynamic.ps1 (grown)     |
-                                            |   result.md (per-criterion)|
-                                            +-------------+-------------+
-                                                          |
-                                                          v
-                                                +---------+---------+
-                                                | Snapshotted VM:   |
-                                                | STEP 1..15        |
-                                                | observed effect   |
-                                                +-------------------+
+Public sources ──▶ Containerised collectors ──▶ Content-addressed store
+                   (msupdate / vendor / snappy)   + byte-triage index
+                                                             │
+                                                             ▼
+                                                   pipeline.query + report --pick
+                                                             │
+                                                             ▼
+                                                   reports/<sha256>/
+                                                     <driver>.sys
+                                                     <driver>.c    (Ghidra)
+                                                     dynamic.ps1   (grown)
+                                                     result.md     (verdict)
+                                                             │
+                                                             ▼
+                                                   Snapshotted VM: STEP 1..15
 ```
+
+The agent (per [`AGENTS.md`](AGENTS.md)) drives candidates from the byte-level shortlist through static read and controlled dynamic validation under full Secure Boot + HVCI, and emits a confirmed/rejected result against six criteria.
 
 ## Quickstart
 
 ```bash
 docker compose build
-docker compose run --rm msupdate-catalog   # primary: WHQL HID packages
+
+# collect
+docker compose run --rm msupdate-catalog   # WHQL HID packages (primary)
 docker compose run --rm vendor-catalog     # Dell / HP OEM catalogs
 docker compose run --rm snappy-driver      # SDI input driverpacks (torrent)
-```
 
-Outputs:
-
-```
-pipeline_out/
-  drivers/<sha256>.sys                 # the corpus
-  drivers/index.jsonl                  # append-only index (analysis + provenance)
-  collectors/<name>/
-    discovery_cache.json               # resumeable search walk (TTL)
-    processed.jsonl                    # per-item ledger
-    <timestamp>/manifest.json          # per-run summary
-```
-
-Query the corpus:
-
-```bash
+# query
 python -m pipeline.query --stats
 python -m pipeline.query --arch x64 --signed --self-hid --user-mode-interface
-python -m pipeline.query --show <sha-prefix>
+
+# promote a candidate -> reports/<sha256>/ (binary + Ghidra decomp + seed dynamic.ps1)
+docker compose run --rm report --pick
 ```
 
-Build a per-driver report folder (static + seed dynamic script):
-
-```bash
-docker compose run --rm report --pick       # highest-ranked unresolved target
-docker compose run --rm report <sha-prefix> # a specific hash
-```
+Outputs land in `pipeline_out/`: content-addressed store (`drivers/<sha256>.sys`), append-only index (`drivers/index.jsonl`), per-collector discovery cache and ledger.
 
 ## Collectors
 
-| Collector | What it pulls | Mechanism |
-|-----------|---------------|-----------|
-| `msupdate-catalog` | Microsoft Update Catalog — WHQL-signed HID driver packages | Playwright-driven search pagination &rarr; `DownloadDialog` &rarr; CDN `.cab` |
-| `vendor-catalog` | Dell (`CatalogPC.cab`) + HP (`HpCatalogForSms`) OEM catalogs | parse catalog XML &rarr; per-component `.cab`/`.exe` |
-| `snappy-driver` | Snappy Driver Installer input driverpacks (`DP_Touchpad_*`, `DP_HID`) | aria2 BitTorrent with selective `--select-file` (Docker-only) |
+| Collector | Pulls | Mechanism |
+|-----------|-------|-----------|
+| `msupdate-catalog` | Microsoft Update Catalog — WHQL-signed HID packages | Playwright &rarr; `DownloadDialog` &rarr; CDN `.cab` |
+| `vendor-catalog` | Dell + HP OEM catalogs | catalog XML &rarr; `.cab` / `.exe` |
+| `snappy-driver` | SDI input driverpacks (`DP_Touchpad_*`, `DP_HID`) | aria2 BitTorrent, `--select-file` |
 
-Each collector resumes from a discovery cache (default TTL 7 days) and a
-per-item ledger. See [AGENTS.md &sect;2.1](AGENTS.md#21-pick-the-target) for
-how an agent widens the shortlist when the default picker is exhausted.
+Each resumes from a discovery cache (TTL 7d) and per-item ledger. See [AGENTS.md §2.1](AGENTS.md#21-pick-the-target) for how the agent widens the shortlist when the picker is exhausted.
 
 ## Triage model
 
-`index.jsonl` carries, per sha256, every byte-reachable axis. The verdict is a
-convenience label — a shortlist handle, not a confirmation.
+`index.jsonl` carries, per sha256, every byte-reachable axis. The verdict is a shortlist handle, not a confirmation.
 
 | Axis | Meaning |
 |------|---------|
 | `mouse_injection` | direct mouse-stack injection signals |
 | `keyboard_injection` | keyboard-side analog (disqualifying on its own) |
 | `user_mode_interface` | user-openable control surface (device + symlink) |
-| `self_hid_device` | VHF, HID minidriver, or hidclass/hidparse/vhf linkage |
+| `self_hid_device` | VHF, HID minidriver, or hidclass linkage |
 | `hardware_independent_init` | unknown in byte triage; dynamic-only |
-| `x64_driver` | PE is an x64 kernel driver |
-| `signature_present` | embedded Authenticode blob (not validity) |
+| `x64_driver` + `signature_present` | PE arch + embedded Authenticode blob |
 
-| Verdict | Rank | Meaning |
-|---------|------|---------|
-| `match` | 4 | self-HID + user-mode control + mouse evidence + x64 driver + embedded signature |
-| `candidate` | 3 | self-HID + user-mode control, with mouse evidence or another gating fact unproven |
-| `self_hid` | 2 | self-HID evidence, user-mode control unproven |
-| `keyboard_only` | 1 | keyboard evidence without mouse or self-HID; outside the target |
-| `none` | 0 | no self-HID lead and no keyboard-only classification |
-
-Records are rescored on read, so query results reflect the current profile
-without rebuilding the store. For the full criterion list and how
-confirmation is actually established, see
-[AGENTS.md &sect;1 — Required target profile](AGENTS.md#1-required-target-profile).
-
-## The corpus
-
-As of the last sweep: **6572** records, 5818 with an embedded-signature blob.
+Verdicts rank from `match` (all axes present) down to `none`. Records are rescored on read, so queries always reflect the current profile. For the full criterion list and how confirmation is established, see [AGENTS.md §1](AGENTS.md#1-required-target-profile).
 
 <details>
-<summary>Verdict distribution (historical, previous profile)</summary>
+<summary>Corpus at a glance (6572 records; historical scoring)</summary>
 
 | verdict | files |
 |---------|-------|
@@ -211,143 +120,44 @@ As of the last sweep: **6572** records, 5818 with an embedded-signature blob.
 | `self_hid` | 1743 |
 | `none` | 3714 |
 
-Axis counts: `signature_present=5818`, `x64_driver=4808`,
-`user_mode_interface=3809`, `self_hid_device=1743`,
-`hardware_independent_init=931`, `keyboard_injection=184`, `mouse_injection=5`.
-Arch: `x64=4808`, `x86=1700`, `arm64=58`, `ia64=4`.
+Axis counts: `signature_present=5818`, `x64_driver=4808`, `user_mode_interface=3809`, `self_hid_device=1743`, `mouse_injection=5`. Arch: `x64=4808`, `x86=1700`, other=62.
 
-The byte-level mouse-stack injection seam is thin (5 binaries total); none
-combine signed x64 with mouse-stack injection. These stats reflect the
-previous scoring profile and are kept as a historical reference.
+The byte-level mouse-stack injection seam is thin (5 binaries total). These stats are the previous scoring profile, kept as historical reference.
 </details>
-
-## Project structure
-
-```
-hid-driver-triage/
-  AGENTS.md                     # <-- the LLM operating spec (start here)
-  README.md                     # this file
-  docker-compose.yml
-  Dockerfile                    # collector image
-  Dockerfile.ghidra             # analysis image (Ghidra headless + pipeline)
-  pipeline/
-    index.py                    # triage axes, verdict, apply_hid_profile
-    query.py                    # composable filters over index.jsonl
-    report.py                   # --pick + per-report folder materialisation
-    collectors/
-      msupdate_catalog/
-      vendor_catalog/
-      snappy_driver/
-  pipeline_out/                 # bind-mounted outputs
-  reports/<sha256>/             # per-driver report folders
-```
 
 ## Tuning
 
-Set before `docker compose run`.
+Set env vars before `docker compose run`. Common ones:
 
-<details>
-<summary><code>msupdate-catalog</code></summary>
+- `PDT_MSC_MAX_PACKS=N` — cap packages this run (`msupdate-catalog`)
+- `PDT_MSC_MAX_MB=100` — per-`.cab` size cap
+- `PDT_*_REFRESH=1` / `PDT_*_REFRESH_DISCOVERY=1` — ignore ledger / discovery cache
+- `PDT_*_DISCOVERY_TTL_DAYS=7` — discovery cache lifetime
+- `PDT_VC_SOURCES=dell,hp` — which OEM catalogs
+- `PDT_SDI_CATEGORIES=touchpad,hid` — SDI driverpack families
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `PDT_MSC_QUERIES` | curated | `;`-separated search terms (~595 defaults) |
-| `PDT_MSC_MAX_PAGES` | `40` | pages per query (catalog caps at 40&times;25) |
-| `PDT_MSC_BROWSER_WORKERS` | `6` | parallel Chromium search workers |
-| `PDT_MSC_JOBS` | `8` | download workers |
-| `PDT_MSC_MAX_PACKS` | `0` | cap packages this run (0 = unlimited) |
-| `PDT_MSC_MAX_MB` | `100` | per-`.cab` size cap |
-| `PDT_MSC_REFRESH` / `PDT_MSC_REFRESH_DISCOVERY` | off | ignore ledger / discovery cache |
-| `PDT_MSC_DISCOVERY_TTL_DAYS` | `7` | discovery cache lifetime |
-</details>
-
-<details>
-<summary><code>vendor-catalog</code></summary>
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `PDT_VC_SOURCES` | `dell,hp` | which OEM catalogs to crawl |
-| `PDT_VC_JOBS` | `8` | download workers |
-| `PDT_VC_MAX_PACKS` | `0` | cap packages this run |
-| `PDT_VC_MAX_MB` | `300` | per-package size cap |
-| `PDT_VC_REFRESH` / `PDT_VC_REFRESH_DISCOVERY` | off | ignore ledger / discovery cache |
-| `PDT_VC_DISCOVERY_TTL_DAYS` | `7` | discovery cache lifetime |
-</details>
-
-<details>
-<summary><code>snappy-driver</code></summary>
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `PDT_SDI_CATEGORIES` | `touchpad,hid` | `DP_*` families to select |
-| `PDT_SDI_BT_TIMEOUT` | `300` | abort stalled swarm (seconds) |
-| `PDT_SDI_SEED_TIME` | `0` | seed time after download |
-| `PDT_SDI_MAX_PACKS` | `0` | cap selected packs |
-| `PDT_SDI_REFRESH` / `PDT_SDI_REFRESH_DISCOVERY` | off | ignore ledger / re-fetch torrent |
-</details>
+Full list in each collector's section of `docker-compose.yml`.
 
 ## Safety model
 
-Collection is static end-to-end: downloads, extraction, and PE header peeks
-run containerised and never execute a driver. Binaries are parsed as bytes
-only. Dynamic analysis belongs in isolated VMs — not in the collector image.
-The agent spec enforces this in rules R4-R6.
-
-## Source landscape — what was rejected and why
+Collection is static end-to-end: downloads, extraction, and PE header peeks run containerised and never execute a driver. Binaries are parsed as bytes only. Dynamic analysis lives in isolated VMs — enforced by [`AGENTS.md`](AGENTS.md) rules R4–R6.
 
 <details>
-<summary>Expand</summary>
+<summary>Source landscape — what was rejected and why</summary>
 
-The target is narrow, and most driver sources do not carry it. The structural
-reason: **"dumb" mice and keyboards ship in-box HID and carry no vendor
-`.sys`**, so general driver repos are thin on exactly the target.
-HID-input `.sys` density lives in only two places, both already covered:
-touchpad OEMs (Synaptics / Elan / Alps / Cypress-touch &rarr; `snappy-driver`)
-and WHQL HID filters (&rarr; `msupdate-catalog`).
+The target is narrow, and most driver sources do not carry it. The structural reason: **"dumb" mice and keyboards ship in-box HID and carry no vendor `.sys`**, so general driver repos are thin on exactly the target. HID-input `.sys` density lives in only two places, both already covered: touchpad OEMs (Synaptics / Elan / Alps / Cypress-touch &rarr; `snappy-driver`) and WHQL HID filters (&rarr; `msupdate-catalog`).
 
 Rejected after investigation:
 
-- **Community web archives** (`driverguide`, `softpedia`, `driverscape`) —
-  every one rate-limits or bot-blocks a sustained sweep (Cloudflare 429 /
-  tarpitting). Not dependable for full-corpus volume.
-- **archive.org** — no rate limit and huge, but driver items are opaque
-  ISO/RAR blobs (0.3-15 GB to extract maybe one `.sys`); the dense items
-  are DriverPack ISOs that overlap `snappy-driver`'s upstream; HID-input
-  density is low (audio / GPU / NIC / legacy dominate).
-- **Station-Drivers** — no login/captcha and clean per-file downloads
-  (redirects to the vendor's own CDN), but organized by *silicon* vendor;
-  the mouse/keyboard branches are vestigial (Logitech = 1 package,
-  keyboard = 0; Cypress = USB3.0 host controllers, not touchpad).
-- **Gaming-mouse peripheral vendors** (Rapoo, Fantech, Bloody/A4Tech,
-  Redragon, Marvo, &hellip;) — their config software is **usermode-only**.
-  Tested installers (Rapoo `Driver_Setup`, Fantech Crypto, Bloody7 suite)
-  carry **zero `.sys`, no `.inf`, no `.cat`, and no
-  `CreateService`/class-callback logic**. Even macro / anti-recoil engines
-  run in user mode (SendInput / HID feature reports); the budget brands
-  share one Chinese-ODM app. Kernel HID filters are a legacy pattern that
-  `msupdate-catalog` + `snappy-driver` already capture.
+- **Community web archives** (`driverguide`, `softpedia`, `driverscape`) — every one rate-limits or bot-blocks a sustained sweep. Not dependable.
+- **archive.org** — no rate limit and huge, but driver items are opaque ISO/RAR blobs (0.3-15 GB to extract maybe one `.sys`); dense items are DriverPack ISOs that overlap `snappy-driver`'s upstream.
+- **Station-Drivers** — clean per-file downloads, but organized by *silicon* vendor; mouse/keyboard branches are vestigial.
+- **Gaming-mouse peripheral vendors** (Rapoo, Fantech, Bloody/A4Tech, Redragon, Marvo, &hellip;) — their config software is **usermode-only**. Zero `.sys`, no `.inf`, no `CreateService`/class-callback logic. Even macro / anti-recoil engines run in user mode (SendInput / HID feature reports).
 </details>
-
-## Confirmed targets
-
-Each confirmed-or-rejected target lands in `reports/<sha256>/result.md`.
-Scope limits are recorded alongside the verdict (which Windows builds were
-tested, which access modes measured, which capabilities exercised).
-
-Current public results:
-
-| sha256 | driver | verdict | writeup |
-|---|---|---|---|
-| `c8819dbd...414de9f5c` | `vhidev.sys` / `vhidflt.sys` (Virtual HID Provider 18.13.46.429) | **CONFIRMED** on Windows 11 build 26300 under Secure Boot + HVCI + VBS; all six criteria met | [`dzn0/vhidev-hid-takeover`](https://github.com/dzn0/vhidev-hid-takeover) |
-
-See [Findings](#findings) above for the short version of this result and why
-it matters.
 
 ## For AI agents
 
-If you are an LLM operating in this repo: load [`AGENTS.md`](AGENTS.md)
-before anything else. It is dense on purpose. Every clause there is a
-precondition for valid output; this README is advertising.
+Load [`AGENTS.md`](AGENTS.md) before anything else. It is dense on purpose. Every clause there is a precondition for valid output; this README is advertising.
 
 ## License
 
