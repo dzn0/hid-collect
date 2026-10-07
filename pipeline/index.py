@@ -18,15 +18,11 @@ The target profile, in byte-reachable form. We hunt a driver that:
      (signature validity and OS/HVCI loading eligibility are confirmed later);
   2. exposes a **user-mode control interface** — a named device + symbolic link
      user mode can open and drive with IOCTLs;
-  3. requests **arbitrary mouse movement specifically** — direct mouse-stack
-     injection via MouseClassServiceCallback / \\Device\\PointerClass* / crafted
-     MOUSE_INPUT_DATA. A keyboard-only direct path does NOT qualify.
-  4. does **not create or depend on its own HID device** — no Virtual HID
-     Framework use, no HID minidriver registration, no linkage against
-     hidclass/hidparse/vhf. Confirmed self-created HID is disqualifying.
-  5. is **hardware-independent at init** — approximated by creation of the user
-     control device (IoCreateDevice + IoCreateSymbolicLink) without any HID
-     binding, i.e. the control surface appears without a PnP-attached peripheral.
+  3. requests **arbitrary mouse movement** through its own HID mouse device;
+     direct mouse-stack signals are useful evidence, not a required mechanism;
+  4. creates its **own HID device** — VHF or HID minidriver evidence is a lead,
+     while HID linkage alone cannot establish actual device creation;
+  5. is **hardware-independent at init**, which byte triage leaves unknown.
 
 The byte-level view cannot establish signature validity, HVCI/blocklist loading,
 effective ACLs, or that a particular call path actually moves the cursor; those
@@ -143,10 +139,7 @@ _CREATE_DEVICE_IMPORTS = {"iocreatedevice", "iocreatedevicesecure",
                           "wdmlibiocreatedevicesecure"}
 _SYMLINK_IMPORT = "iocreatesymboliclink"
 
-# SELF-CREATED HID DEVICE — virtual or minidriver. Disqualifying under the
-# target profile: a driver that stands up its own HID endpoint is doing the
-# legitimate thing, not the mouse-stack injection pattern we hunt. VHF = Virtual
-# HID Framework; a HID minidriver links hidclass/hidparse.
+# SELF-CREATED HID DEVICE — required lead; confirm creation dynamically.
 _VHF_IMPORTS = {"vhfcreate", "vhfstart", "vhfreadreportsubmit", "vhfdeletedevice",
                 "vhfasleep", "vhfresume"}
 _HID_MINIDRIVER_IMPORTS = {"hidregisterminidriver"}
@@ -571,6 +564,45 @@ def extract_strings(data: bytes, min_len: int = 5) -> list[str]:
 # ----------------------------------------------------------- HID-input signals
 
 
+def apply_hid_profile(hid: dict, pe: dict) -> dict:
+    """Rescore stored axes without trusting verdicts from the previous profile."""
+    h = dict(hid)
+    ev = h.get("evidence") or {}
+    own = bool(h.get("self_hid_device", h.get("virtual_hid"))
+               or ev.get("vhf_imports") or ev.get("hid_minidriver"))
+    control = bool(h.get("user_mode_interface") or ev.get("creates_user_device")
+                   or ev.get("symlinks"))
+    mouse = bool(h.get("mouse_injection") or ev.get("mouse_injection_imports")
+                 or ev.get("mouse_injection_strings") or ev.get("mouse_class_targets")
+                 or ev.get("mouse_class_attach")
+                 or {"GUID_CLASS_MOUSE", "GUID_DEVINTERFACE_MOUSE"}.intersection(
+                     ev.get("class_guids") or []))
+    keyboard = bool(h.get("keyboard_injection") or ev.get("keyboard_injection_imports")
+                    or ev.get("keyboard_injection_strings")
+                    or {"GUID_CLASS_KEYBOARD", "GUID_DEVINTERFACE_KEYBOARD"}.intersection(
+                        ev.get("class_guids") or []))
+    x64 = pe.get("arch") == "x64" and bool(pe.get("is_driver"))
+    signed = bool(pe.get("signed"))
+    if own and control and mouse and x64 and signed:
+        verdict = "match"
+    elif own and control:
+        # Keyboard signals alone cannot rule out an additional HID mouse path.
+        verdict = "candidate"
+    elif own:
+        verdict = "self_hid"
+    elif keyboard and not mouse:
+        verdict = "keyboard_only"
+    else:
+        verdict = "none"
+    h.update(profile="self_hid_mouse_v1", verdict=verdict,
+             rank={"match": 4, "candidate": 3, "self_hid": 2,
+                   "keyboard_only": 1, "none": 0}[verdict],
+             self_hid_device=own, virtual_hid=own, user_mode_interface=control,
+             mouse_evidence=mouse, hardware_independent_init=None,
+             x64_driver=x64, signature_present=signed)
+    return h
+
+
 def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
                       strings_low: list[str], guids: set[str],
                       symlinks: list[str], device_names: list[str],
@@ -578,13 +610,10 @@ def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
                       signed: bool = False) -> dict:
     """Score the target-profile axes and return a verdict + auditable evidence.
 
-    The target is a Windows x64 kernel driver with an embedded Authenticode blob
-    that exposes a user-mode control interface for ARBITRARY MOUSE movement by
-    driving the mouse class stack directly, without creating or depending on its
-    own HID device. Keyboard-only direct injection does NOT qualify. Signature
-    validity, HVCI/blocklist loading, effective ACLs, and that a call actually
-    moves the cursor are confirmed downstream; the bytes only tell us whether a
-    binary is worth looking at."""
+    The target creates its own HID mouse and accepts user-mode movement requests.
+    Byte signals shortlist candidates; actual creation, mouse reports, hardware
+    independence, signature validity and loading require downstream validation.
+    """
     joined = "\n".join(strings_low)
 
     # ── mouse-side direct injection ────────────────────────────────────────
@@ -608,17 +637,14 @@ def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
         _SYMLINK_IMPORT in imports_flat
     user_mode_interface = creates_device or bool(symlinks)
 
-    # ── self-created HID device (disqualifying) ────────────────────────────
+    # ── self-created HID device (required evidence) ────────────────────────────
     vhf = sorted(imports_flat & _VHF_IMPORTS)
     hid_minidriver = bool(imports_flat & _HID_MINIDRIVER_IMPORTS) or \
         bool(imported_dlls & _HID_CLASS_DLLS)
     self_hid_device = bool(vhf or hid_minidriver)
 
-    # ── hardware-independent initialization (byte approximation) ───────────
-    # Control device appears from DriverEntry-style creation, with no HID
-    # minidriver / VHF binding. Does not prove the control surface is reachable
-    # without a PnP peripheral — only that the bytes do not depend on one.
-    hardware_independent_init = creates_device and not self_hid_device
+    # Imports cannot establish whether initialization requires physical hardware.
+    hardware_independent_init = None
 
     guid_hits = sorted({_HID_CLASS_GUIDS[g] for g in guids if g in _HID_CLASS_GUIDS})
     input_adjacent = bool(mouse_targets or kbd_targets or guid_hits or any(
@@ -628,26 +654,7 @@ def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
     x64_driver = (arch == "x64") and is_driver
     signature_present = bool(signed)
 
-    # ── verdict ────────────────────────────────────────────────────────────
-    if self_hid_device:
-        verdict = "self_hid"
-    elif (mouse_injection and user_mode_interface and
-          x64_driver and signature_present):
-        verdict = "match"             # full target profile reachable from bytes
-    elif mouse_injection:
-        verdict = "candidate"         # mouse-stack injection present; gating gap
-    elif keyboard_injection:
-        verdict = "keyboard_only"     # direct injection but wrong device class
-    elif user_mode_interface and input_adjacent:
-        verdict = "candidate"         # user-mode device touching the input class
-    else:
-        verdict = "none"
-    rank = {"match": 4, "candidate": 3, "keyboard_only": 2,
-            "self_hid": 1, "none": 0}[verdict]
-
-    return {
-        "verdict": verdict,
-        "rank": rank,
+    return apply_hid_profile({
         # target-profile axes
         "mouse_injection": mouse_injection,
         "keyboard_injection": keyboard_injection,
@@ -680,7 +687,7 @@ def hid_input_signals(imports_flat: set[str], imported_dlls: set[str],
             "class_device_targets": sorted(set(mouse_targets) | set(kbd_targets)),
             "class_stack_attach": mouse_attach or kbd_attach,
         },
-    }
+    }, {"arch": arch, "is_driver": is_driver, "signed": signed})
 
 
 # ------------------------------------------------------------------ loldrivers
@@ -820,6 +827,9 @@ def fold_index(drivers_dir: Path | None = None) -> dict[str, dict]:
             pkg = prov.get("package_url") or prov.get("installer_url")
             if pkg and pkg not in e["seen_in"]:
                 e["seen_in"].append(pkg)
+    for record in out.values():
+        if isinstance(record.get("hid_input"), dict):
+            record["hid_input"] = apply_hid_profile(record["hid_input"], record.get("pe") or {})
     return out
 
 

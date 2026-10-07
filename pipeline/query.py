@@ -494,11 +494,11 @@ def main(argv: list[str] | None = None) -> int:
                    metavar="VERDICT", help="match/candidate/virtual_hid/none (repeatable)")
     f.add_argument("--min-rank", type=int, metavar="N", dest="min_rank",
                    help="hid_input.rank >= N "
-                        "(match=4, candidate=3, keyboard_only=2, self_hid=1, none=0)")
+                        "(match=4, candidate=3, self_hid=2, keyboard_only=1, none=0)")
     f.add_argument("--direct-injection", action="store_true", dest="direct_injection",
                    help="drives any input class stack directly (legacy; mouse OR keyboard)")
     f.add_argument("--mouse-injection", action="store_true", dest="mouse_injection",
-                   help="drives the MOUSE class stack directly (required by target profile)")
+                   help="drives the MOUSE class stack directly (optional evidence)")
     f.add_argument("--keyboard-injection", action="store_true", dest="keyboard_injection",
                    help="drives the keyboard class stack directly "
                         "(disqualifying on its own under the target profile)")
@@ -506,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="exposes a user-mode control interface (device + symlink)")
     f.add_argument("--self-hid", action="store_true", dest="self_hid",
                    help="creates or depends on its own HID device "
-                        "(VHF / HID minidriver / hidclass/hidparse/vhf linkage) — disqualifies")
+                        "(VHF / HID minidriver / hidclass/hidparse/vhf linkage; confirm creation)")
     f.add_argument("--no-self-hid", action="store_true", dest="no_self_hid",
                    help="is NOT a self-created HID device")
     f.add_argument("--virtual-hid", action="store_true", dest="virtual_hid",
@@ -514,8 +514,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--no-virtual-hid", action="store_true", dest="no_virtual_hid",
                    help="legacy alias of --no-self-hid")
     f.add_argument("--hw-independent", action="store_true", dest="hw_independent",
-                   help="control device appears without HID binding "
-                        "(byte approximation of hardware-independent init)")
+                   help="hardware independence is verified "
+                        "(currently unknown in byte triage; this filter yields no candidates)")
     f.add_argument("--x64-driver", action="store_true", dest="x64_driver",
                    help="PE is an x64 kernel driver (target profile prerequisite)")
 

@@ -75,41 +75,17 @@ def safe_stem(name: str) -> str:
 def _candidate_score(rec: dict) -> tuple | None:
     """Rank a folded record as a static analysis target, or None to exclude.
 
-    Mirrors the README target profile's byte-reachable prerequisites: we want a
-    signed x64 driver that exposes a user-mode control device and is NOT a
-    self-created HID device. Among those, prefer the ones whose evidence leans
-    closest to real mouse-stack injection (the one axis byte-triage usually
-    can't confirm), then larger/control-rich surfaces.
+    Require signed x64, a control surface and self-HID evidence. Mouse evidence
+    improves priority but is not required to investigate an unproven HID path.
     """
     pe = rec.get("pe") or {}
-    hid = rec.get("hid_input") or {}
+    hid = index_mod.apply_hid_profile(rec.get("hid_input") or {}, pe)
     ev = hid.get("evidence") or {}
-
-    if pe.get("arch") != "x64" or not pe.get("is_driver"):
+    if not (hid["x64_driver"] and hid["signature_present"]
+            and hid["self_hid_device"] and hid["user_mode_interface"]):
         return None
-    if not pe.get("signed"):
-        return None
-    if hid.get("verdict") not in ("candidate", "match"):
-        return None
-    if ev.get("hid_minidriver") or ev.get("vhf_imports"):
-        return None
-    if not ev.get("creates_user_device"):
-        return None
-
-    mouse = bool(ev.get("mouse_injection_imports")
-                 or ev.get("mouse_injection_strings")
-                 or ev.get("mouse_class_attach")
-                 or ev.get("mouse_class_targets"))
-    attach = bool(ev.get("class_stack_attach") or ev.get("class_device_targets"))
-    symlinks = len(ev.get("symlinks") or [])
-
-    return (
-        hid.get("rank", 0),
-        1 if mouse else 0,
-        1 if attach else 0,
-        symlinks,
-        rec.get("size", 0),
-    )
+    return (hid["rank"], int(bool(ev.get("vhf_imports"))),
+            len(ev.get("symlinks") or []), rec.get("size", 0))
 
 
 def pick_best(records: dict[str, dict]) -> tuple[str, dict, str] | None:
@@ -129,7 +105,7 @@ def pick_best(records: dict[str, dict]) -> tuple[str, dict, str] | None:
 
 def _reason(rec: dict) -> str:
     pe = rec.get("pe") or {}
-    hid = rec.get("hid_input") or {}
+    hid = index_mod.apply_hid_profile(rec.get("hid_input") or {}, pe)
     ev = hid.get("evidence") or {}
     info = _info(rec)
     name = display_name(rec)
@@ -140,9 +116,9 @@ def _reason(rec: dict) -> str:
                  or ev.get("mouse_class_attach"))
     bits = [
         "%s (%s), %s" % (name, company, hid.get("verdict")),
-        "x64 signed driver",
+        "x64 driver with embedded signature (validity unverified)",
         "user-mode control surface: %s" % symlinks,
-        "no self-created HID device",
+        "self-created HID evidence (creation and mouse path unverified)",
     ]
     bits.append("mouse-stack injection in bytes: %s"
                 % ("yes" if mouse else "not yet -- confirm dynamically"))
@@ -248,7 +224,7 @@ DYNAMIC_TEMPLATE = r"""# dynamic.ps1 — single, incrementally-grown dynamic-ana
 #   1 identify  2 environment  3 validate-signature  4 install/load
 #   5 init  6 discover-interface  7 open/permissions  8 protocol
 #   9 exercise-ioctls  10 arbitrary-movement  11 causality
-#   12 hw-independence  13 exclude-self-hid  14 lifecycle  15 reproduce/emit
+#   12 hw-independence  13 confirm-self-hid  14 lifecycle  15 reproduce/emit
 #
 # Start with only what is necessary; add the next STEP block when the previous
 # one is confirmed.
@@ -344,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         picked = pick_best(records)
         if picked is None:
             print("no eligible target (need a signed x64 candidate with a "
-                  "user-mode device and no self-created HID)")
+                  "user-mode interface and self-created HID evidence)")
             return 1
         sha, rec, reason = picked
         if a.json:

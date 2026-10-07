@@ -7,9 +7,15 @@ deduplicates into a content-addressed store.
 
 **Goal.** Identify Windows mouse drivers that expose a user-mode control
 interface through which an application can request arbitrary synthetic mouse
-movement through the existing Windows mouse input stack, without depending on a
-specific physical peripheral. The driver must not create or depend on a HID
-device of its own, including a virtual or software-enumerated HID device.
+control through the existing Windows mouse input stack, without depending on a
+specific physical peripheral. The driver must create its own HID mouse device
+(virtual or software-enumerated) and deliver caller-controlled movement or click through it.
+
+**Profile update — HID creation is required.** The picker and triage now require
+self-created HID evidence. `report --pick` selects signed x64 drivers with HID
+and user-mode control evidence, prioritizing mouse evidence. Queries and the
+picker rescore existing index records on read; no corpus rebuild is required.
+Actual creation, mouse movement and hardware independence still need validation.
 
 ## Agent workflow (AI session)
 
@@ -19,55 +25,28 @@ into a confirmed-or-rejected result against the *Required target profile* below.
 
 ### 1 — Pick the target (automatic, on reading this doc)
 
-Go straight to `pipeline_out/drivers/index.jsonl` and choose the single best
-target *for this attempt*. Use the picker, which encodes the byte-reachable
-prerequisites (signed x64 driver, user-mode control device, no self-created HID,
-leaning toward mouse-stack injection):
-
-```bash
-docker compose run --rm report --pick        # prints: best target sha + one-line why
-```
+Run `docker compose run --rm report --pick`, or shortlist explicitly with
+`python -m pipeline.query --arch x64 --signed --self-hid --user-mode-interface`. Review creation and
+control-interface evidence and choose an unresolved target. Skip targets already
+resolved under `reports/`. Ranks prioritize byte evidence and never constitute confirmation.
 
 Then **stop and confirm with the user before anything else**: state the chosen
-sha256, the driver name, and the reason for the pick — short and direct, one or
-two lines. Do not build anything until the user accepts. If they decline, pick
-the next-best and ask again. Skip targets already resolved under `reports/`.
+sha256, driver name, and reason for the pick. Do not build anything until the user
+accepts. If they decline, pick the next-best and ask again.
 
-#### Fallback ladder (when no ideal target remains)
+If the shortlist is exhausted, inspect `--arch x64 --signed --self-hid` results
+for user-mode interfaces missed by byte triage. Next, inspect
+`--arch x64 --signed --user-mode-interface` results for HID creation missed by
+triage. These widen static evidence only: a confirmed driver must still create
+its own HID mouse, accept caller-controlled movement, and satisfy every required
+criterion. Keep x64 and embedded-signature filtering during this shortlist stage;
+validate signature and loading eligibility separately.
 
-The picker encodes the ideal profile. When every target it can offer is already
-resolved (or rejected), or the whole pickable set collapses to one driver family
-that fails the same criteria, **do not stop** — relax the pick, one rung at a
-time, and tell the user which rung you dropped to and why. Relaxing only ever
-touches the **device-creation / injection** axes. Two things are **never
-analyzable and are excluded at every rung**:
+#### Historical triage insight — the hardware-path false negative
 
-- **32-bit** (`pe.arch` anything other than `x64`) — cannot load on the x64
-  target under the profile.
-- **No embedded Authenticode blob** (`signature_present=false`) — nothing to
-  validate.
-
-And two requirements **never relax**, at any rung: **loading eligibility**
-(criterion 2 — x64 Windows 10/11 with Secure Boot / HVCI / blocklist on) and
-**signature** (criterion 1 — presence here, validity dynamically). Climb down
-only as far as the first rung that yields an unresolved target; stop there.
-
-| Rung | Relax | Still required (never relaxed) | How to enumerate |
-|------|-------|--------------------------------|------------------|
-| 0 — ideal | nothing | full profile | `report --pick` |
-| 1 — unproven injection | mouse-stack injection need not show in the bytes (confirm dynamically) | x64, signed, user-mode control device, no self-created HID | `report --pick` (this is the `candidate` set) |
-| 2 — hardware-bound control | control device may be created during PnP `AddDevice`/attach (not hardware-independent) — record the hardware dependency | x64, signed, user-mode control device, no self-created HID, mouse/pointer-class touch | `query --arch x64 --signed --user-mode-interface --no-virtual-hid --class-guid GUID_CLASS_MOUSE` |
-| 3 — attach-only seam | no caller-openable device of its own required; attaching to / hooking the existing mouse class stack counts | x64, signed, mouse/pointer-class touch, no self-created HID | `query --arch x64 --signed --direct-injection --no-virtual-hid` |
-| 4 — any mouse-class touch | drop the injection shape; any mouse/pointer-class reference qualifies for review | x64, signed | `query --arch x64 --signed --class-guid GUID_CLASS_MOUSE` (and `--device`/`--symlink` on pointer names) |
-
-At every rung keep `--signed` (signature presence) and `--arch x64` — these
-encode the two hard invariants and the never-relaxed loading/signature
-requirements. A self-created HID device (criterion 6) and a keyboard-only path
-(criterion 5) remain disqualifying through rung 3; only rung 4 is a last-resort
-widening for manual review, and anything surfaced there is still measured against
-the full *Required target profile* before it can be confirmed.
-
-#### Triage insight — the hardware-path false negative (learned from analysis)
+These filter findings concern the previous profile. A filter that only uses an
+existing mouse stack fails the current criterion 6. For the current profile,
+trace requests through the driver's own HID mouse and verify its enumeration.
 
 Being a legitimate WHQL driver does **not** exclude the capability; a perfectly
 legitimate signed driver can still expose user-mode arbitrary mouse injection, and
@@ -86,7 +65,7 @@ see:
   criterion 5 (no caller-controlled X/Y) and, being PnP-bound to a specific
   touchpad, also fail criterion 3. The byte heuristic's `mouse_injection` and even
   `hardware_independent_init=true` are false positives for this family.
-- **What a real target looks like.** A standalone **mouse** filter (not touchpad)
+- **What the previous profile sought.** A standalone **mouse** filter (not touchpad)
   that creates its **own named control device independently** (not gated behind
   AddDevice/attach to a specific PDO), touches the mouse class, has no self-created
   HID, and — the part only decompilation confirms — reaches a synthetic-input /
@@ -205,8 +184,8 @@ reports/<sha256>/
 Read `<original-name>.c` and the folded `index.jsonl` line and establish, from
 the decompilation, the profile's byte-reachable criteria: the control device
 and symlink creation (criterion 4), hardware-independent init (criterion 3),
-absence of a self-created HID device (criterion 6), and any mouse-class-stack
-injection seam (criterion 5). Signature *presence* is in the index; signature
+creation of its own HID mouse device (criterion 6), and the user-request-to-HID
+movement path (criterion 5). Signature *presence* is in the index; signature
 *validity* (criterion 1) is confirmed dynamically. Report what holds and what
 is still unknown. Only move on once the static picture is clear.
 
@@ -237,8 +216,8 @@ drop an earlier step. Start with only what is necessary (the seed covers steps
 | 9 | **Exercise valid IOCTLs** — send controlled requests; record code, buffers, sizes, return, bytes out, sync/async completion. | Request processed, response documented. |
 | 10 | **Prove arbitrary movement** — vary X and Y independently, signs and magnitudes; distinguish relative vs absolute; observe input events and cursor effect. | The caller controls movement, with no physical movement. |
 | 11 | **Demonstrate causality** — compare idle periods against known command sequences; correlate timing/parameters/events; exclude helper software and VM mouse integration. | Evidence the driver request produces the movement. |
-| 12 | **Prove hardware independence** — repeat init and operation without the vendor peripheral, from a clean state; document the existing mouse stack used. | Works without specific hardware; may ride the existing input stack. |
-| 13 | **Exclude a self-created HID device** — inspect device/stacks before/after and correlate with the driver analysis; confirm no own HID (incl. virtual). | The working path meets "no self-created HID". |
+| 12 | **Prove hardware independence** — repeat init and operation without the vendor peripheral, from a clean state; document the created HID mouse and its stack. | The HID mouse enumerates and works without specific physical hardware. |
+| 13 | **Confirm a self-created HID mouse device** — inspect devices/stacks before/after, correlate the new HID mouse with the driver, and trace caller-controlled movement through it. | The driver creates its own HID mouse and uses it for the demonstrated movement. |
 | 14 | **Test stability + lifecycle** — bounded repetition, close/reopen handles, kill the client, reboot, unload when supported. | Repeatable, no crashes or stuck resources in the tested scenarios. |
 | 15 | **Reproduce and emit the result** — re-run the minimal PoC on the intended builds and consolidate evidence per criterion. | Per-binary, per-environment verdict: confirmed / does not meet / inconclusive. |
 
@@ -264,9 +243,10 @@ All of the following must be established for a confirmed target:
 3. **Hardware-independent initialization.** The control interface and mouse
    functionality must become available without a particular mouse, touchpad,
    external peripheral, or hardware-specific PnP attachment. Creating the control
-   device from DriverEntry or a helper is one acceptable pattern. The control
-   device must not be a self-created HID device. A running service without a
-   usable control interface does not satisfy this requirement.
+   device from DriverEntry or a helper is one acceptable pattern. Software-driven
+   PnP enumeration of the required HID mouse is acceptable. The control interface
+   may be separate from the HID input device. A running service without a usable
+   control interface and functioning HID mouse does not satisfy this requirement.
 4. **User-mode control.** An application must be able to open the exposed control
    interface and send requests. Administrator-only access and access without
    elevation are both acceptable; record the actual access requirements and
@@ -277,16 +257,17 @@ All of the following must be established for a confirmed target:
    commands, and keyboard-only injection do not qualify. Document whether the
    interface accepts relative deltas, absolute positions, or both. Buttons and
    wheel support can be recorded separately; they do not substitute for movement.
-6. **No self-created HID device.** The driver must not create or depend on its
-   own HID mouse device, whether virtual, software-enumerated, or implemented
-   through a HID minidriver. A named control device used for user-mode requests
-   is acceptable when it is not a HID input device. Attaching to the existing
-   mouse stack or using its service callback remains in scope, but neither alone
-   proves arbitrary caller-controlled mouse movement.
+6. **Required self-created HID mouse device.** The driver must create its own
+   HID mouse device, virtual or software-enumerated, for example through VHF or
+   a HID minidriver. User-mode requests must produce arbitrary mouse movement
+   through this device. Confirm creation, enumeration, and the request-to-input
+   path; imports or HID linkage alone are insufficient. A separate named control
+   device is acceptable. Attaching to an existing mouse stack or invoking its
+   service callback alone does not satisfy this requirement.
 
 Disabling protections, test-signing mode, signature-enforcement bypasses, and
 patching the binary are outside the required operating profile. A hardware-bound
-filter, self-created HID device, unsigned sample, keyboard-only path, or
+filter, driver without its own HID mouse device, unsigned sample, keyboard-only path, or
 preset-only mouse action does not
 meet the target even if the legacy heuristic labels it `match`.
 
@@ -298,7 +279,8 @@ separate downstream activities, performed in an isolated test environment.
 **Confirmation record.** Keep the exact binary hash, package provenance,
 signature-validation result, tested OS build and protection state, initialization
 dependencies, control-interface access requirements, and evidence linking a
-user-mode request to arbitrary mouse movement. Mark unverified requirements as
+user-mode request to arbitrary mouse movement through the created HID mouse,
+plus evidence of its creation and enumeration. Mark unverified requirements as
 unknown. A candidate becomes confirmed only when every required criterion is
 established; any failed criterion means it does not meet this profile.
 
@@ -375,15 +357,16 @@ host**. Default categories: `touchpad,hid`.
 
 ## Triage — the `hid_input` verdict
 
-The index scores a byte-reachable projection of the target profile above. The
-axes are derived from imports, strings, device/symlink names, class GUIDs, and
+The index scores evidence for the required self-created HID mouse profile.
+Existing records are rescored when folded, preserving their raw evidence and
+provenance. The axes are derived from imports, strings, device/symlink names, class GUIDs, and
 the PE header (arch, is_driver, embedded Authenticode blob):
 
 1. **`mouse_injection`** — direct mouse-class-stack injection
    (`MouseClassServiceCallback`/`MouClassServiceCallback`, `MOUSE_INPUT_DATA`,
    `\Driver\MouClass`/`\Driver\MouHid`, `\Device\PointerClass*`, or
    `IoGetDeviceObjectPointer` + `IoAttachDeviceToDeviceStack` against a mouse
-   class target). Required by criterion 5.
+   class target). A legacy signal, not required for movement via HID reports.
 2. **`keyboard_injection`** — the keyboard-side analog. Tracked so a
    keyboard-only path can be identified and set aside; it is disqualifying on
    its own under the target profile.
@@ -395,11 +378,11 @@ the PE header (arch, is_driver, embedded Authenticode blob):
 4. **`self_hid_device`** — self-created HID endpoint: Virtual HID Framework
    (`VhfCreate`/`VhfStart`/…), HID minidriver registration
    (`HidRegisterMinidriver`), or linkage against `hidclass.sys` / `hidparse.sys`
-   / `vhf.sys`. Disqualifying under criterion 6.
-5. **`hardware_independent_init`** — byte approximation of criterion 3: the
-   driver creates its control device directly and has no HID-stack binding.
-   This cannot prove that initialization survives without a PnP peripheral;
-   confirm dynamically.
+   / `vhf.sys`. A lead for criterion 6; linkage alone does not prove creation.
+5. **`hardware_independent_init`** — criterion 3 remains unknown
+   (`null`) in byte triage: device-creation imports cannot establish independence
+   from physical hardware. Confirm dynamically; `--hw-independent` currently
+   yields no candidates.
 6. **`x64_driver`** — PE arch is `x64` and the header looks like a kernel
    driver. Required by criterion 2 (loading on x64 Windows 10/11).
 7. **`signature_present`** — an embedded Authenticode blob exists.
@@ -408,21 +391,26 @@ the PE header (arch, is_driver, embedded Authenticode blob):
    established separately. Absence of an embedded signature does not rule out
    a valid package-catalog signature.
 
-The verdict folds the axes with the gating facts:
+The verdict folds the byte evidence as follows. A `match` is a shortlist label,
+not proof of HID creation or caller-controlled mouse movement.
 
-| verdict          | rank | meaning |
-|------------------|------|---------|
-| `match`          | 4    | `mouse_injection` AND `user_mode_interface` AND `x64_driver` AND `signature_present` AND NOT `self_hid_device` — all byte-reachable prerequisites hold; perform signature validation and dynamic validation |
-| `candidate`      | 3    | `mouse_injection` without a self-created HID device, but at least one gating fact is missing; OR a user-mode device touching the input class without direct-injection evidence |
-| `keyboard_only`  | 2    | direct injection, but keyboard-side only — does not satisfy criterion 5 |
-| `self_hid`       | 1    | self-created HID device (VHF / HID minidriver / hidclass linkage) — disqualifies under criterion 6 |
-| `none`           | 0    | no target-profile signal in the bytes |
+| verdict | rank | meaning |
+|---------|------|---------|
+| `match` | 4 | self-HID + user-mode control + mouse evidence + x64 driver + embedded signature |
+| `candidate` | 3 | self-HID + user-mode control, with mouse evidence or another gating fact unproven |
+| `self_hid` | 2 | self-HID evidence, with user-mode control unproven |
+| `keyboard_only` | 1 | keyboard evidence without mouse or self-HID evidence; outside the target |
+| `none` | 0 | no self-HID lead and no keyboard-only classification |
+
+Mouse evidence includes direct-stack signals or mouse class/interface GUIDs.
+A HID-report path does not need to import a mouse class callback. Keyboard
+signals on a HID candidate do not prove it lacks an additional mouse path.
 
 For back-compat, each line also carries the legacy aliases `direct_injection`
 (`mouse_injection OR keyboard_injection`) and `virtual_hid` (`self_hid_device`),
 plus union evidence keys so pre-rework queries keep working. `--verdict match`
-and the new flags (`--mouse-injection`, `--self-hid`, `--no-self-hid`,
-`--hw-independent`, `--x64-driver`) target the current profile; `--signed`
+and the flags (`--mouse-injection`, `--self-hid`, `--no-self-hid`,
+`--hw-independent`, `--x64-driver`) expose current scoring and stored axes; `--signed`
 still filters signature *presence*, never validity.
 
 A `match` verdict is a byte-level triage pick, not confirmation. The
@@ -431,7 +419,7 @@ protection-compatible loading on named Windows builds, hardware independence
 proven dynamically, effective ACL on the control interface, and evidence that a
 user-mode request produces arbitrary mouse movement — is built downstream.
 
-### Corpus at a glance
+### Corpus at a glance (historical, previous scoring profile)
 
 As of the last sweep (`python -m pipeline.query --stats`): **6572** records,
 5818 with an embedded-signature blob / 754 without one.
@@ -454,7 +442,8 @@ the whole corpus import or reference `MouseClassServiceCallback`,
 `\Device\PointerClass*`, or the attach primitive against a mouse class target
 (three Samsung `Mouse.sys` / `KbFiltr_FD` variants plus one Elo touch package),
 and none of them combine mouse injection with an embedded signature on an x64
-driver — so **zero** records satisfy the full target profile from bytes alone.
+driver — so **zero** records matched the previous byte-level profile. This does
+not establish how many satisfy the current HID-creation profile.
 
 The 939 `candidate` records are user-mode interfaces touching the input class
 (symlinks + `IoCreateDevice`/`IoCreateSymbolicLink` + mouclass/kbdclass/
@@ -512,7 +501,7 @@ CSV, JSON, a per-driver detail view, or summary stats. Reads the index only.
 ```bash
 python -m pipeline.query --stats                          # corpus at a glance
 python -m pipeline.query --verdict match --signed         # signature-present legacy candidates
-python -m pipeline.query --direct-injection --no-virtual-hid --user-mode-interface  # direct-stack review
+python -m pipeline.query --arch x64 --signed --self-hid --user-mode-interface  # current HID shortlist
 python -m pipeline.query --capability phys_mem --csv      # phys-mem importers
 python -m pipeline.query --loldrivers                     # known-vulnerable hits
 python -m pipeline.query --show aaf74cc5dd16              # one driver, in detail
